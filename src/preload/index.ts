@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
 type AuthState = {
   loggedIn: boolean
   models: Array<{ id: string; name: string }>
@@ -28,6 +30,7 @@ const api = {
     cwd: string
     prompt: string
     modelId: string
+    thinkingLevel: ThinkingLevel
   }): Promise<{ ok: true; requestId: string } | { ok: false; error: string }> => {
     return ipcRenderer.invoke('agent:send-message', payload) as Promise<
       { ok: true; requestId: string } | { ok: false; error: string }

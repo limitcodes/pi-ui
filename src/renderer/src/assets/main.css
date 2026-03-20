@@ -45,6 +45,12 @@ textarea {
   background: hsl(var(--primary) / 0.3);
 }
 
+textarea::selection,
+input::selection {
+  background: rgba(255, 255, 255, 0.28);
+  color: #ffffff;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

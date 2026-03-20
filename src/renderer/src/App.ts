@@ -30,6 +30,17 @@ type ModelOption = {
   name: string
 }
 
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+const THINKING_LEVELS: Array<{ id: ThinkingLevel; label: string }> = [
+  { id: 'off', label: 'off' },
+  { id: 'minimal', label: 'minimal' },
+  { id: 'low', label: 'low' },
+  { id: 'medium', label: 'medium' },
+  { id: 'high', label: 'high' },
+  { id: 'xhigh', label: 'xhigh' }
+]
+
 type AgentStreamEvent =
   | { type: 'start'; chatId: string; requestId: string }
   | { type: 'delta'; chatId: string; requestId: string; delta: string }
@@ -65,6 +76,7 @@ interface PersistedState {
   activeWorkspacePath: string
   activeChatId: string
   selectedModelId: string
+  selectedThinkingLevel: ThinkingLevel
 }
 
 interface AppState extends PersistedState {
@@ -81,7 +93,7 @@ interface AppState extends PersistedState {
   expandedWorkspaces: Set<string>
 }
 
-const STORAGE_KEY = 'pi-ui.chats.v3'
+const STORAGE_KEY = 'pi-ui.chats.v4'
 const DEFAULT_WORKSPACE_PATH = '__no-folder__'
 
 const now = (): number => Date.now()
@@ -170,6 +182,7 @@ const loadState = (): AppState => {
         activeWorkspacePath,
         activeChatId,
         selectedModelId: parsed.selectedModelId ?? 'gpt-5.4',
+        selectedThinkingLevel: parsed.selectedThinkingLevel ?? 'medium',
         composer: '',
         sendingChatId: null,
         authChecked: false,
@@ -193,6 +206,7 @@ const loadState = (): AppState => {
     activeWorkspacePath: DEFAULT_WORKSPACE_PATH,
     activeChatId: '',
     selectedModelId: 'gpt-5.4',
+    selectedThinkingLevel: 'medium',
     composer: '',
     sendingChatId: null,
     authChecked: false,
@@ -211,6 +225,18 @@ let state = loadState()
 let notifyChange: (() => void) | undefined
 let folderPickerInFlight = false
 let unsubscribeStream: (() => void) | undefined
+let composerTextarea: HTMLTextAreaElement | null = null
+
+const syncComposerHeight = (): void => {
+  if (!composerTextarea) return
+
+  const minHeight = 74
+  const maxHeight = 210
+  composerTextarea.style.height = '0px'
+  const nextHeight = Math.min(Math.max(composerTextarea.scrollHeight, minHeight), maxHeight)
+  composerTextarea.style.height = `${nextHeight}px`
+  composerTextarea.style.overflowY = composerTextarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
+}
 
 export const setAppChangeListener = (listener: () => void): void => {
   notifyChange = listener
@@ -322,7 +348,8 @@ const persistState = (): void => {
         })),
         activeWorkspacePath: state.activeWorkspacePath,
         activeChatId: state.activeChatId,
-        selectedModelId: state.selectedModelId
+        selectedModelId: state.selectedModelId,
+        selectedThinkingLevel: state.selectedThinkingLevel
       } satisfies PersistedState)
     )
   } catch (error) {
@@ -334,6 +361,7 @@ const updateState = (updater: (current: AppState) => AppState): void => {
   state = updater(state)
   persistState()
   triggerChange()
+  queueMicrotask(syncComposerHeight)
 }
 
 const syncAuthState = async (): Promise<void> => {
@@ -388,6 +416,21 @@ const setComposer = (value: string): void => {
     composer: value
   }
   triggerChange()
+  queueMicrotask(syncComposerHeight)
+}
+
+const setSelectedModelId = (value: string): void => {
+  updateState((current) => ({
+    ...current,
+    selectedModelId: value
+  }))
+}
+
+const setSelectedThinkingLevel = (value: ThinkingLevel): void => {
+  updateState((current) => ({
+    ...current,
+    selectedThinkingLevel: value
+  }))
 }
 
 const getActiveWorkspace = (): Workspace => {
@@ -538,7 +581,8 @@ const sendMessage = async (): Promise<void> => {
     chatId: activeChat.id,
     cwd: workspace.path,
     prompt: content,
-    modelId: state.selectedModelId
+    modelId: state.selectedModelId,
+    thinkingLevel: state.selectedThinkingLevel
   })
 
   if (!result.ok) {
@@ -573,12 +617,37 @@ const sendMessage = async (): Promise<void> => {
 
 const onGlobalKeyDown = (event: KeyboardEvent): void => {
   const modifier = event.metaKey || event.ctrlKey
+  const target = event.target as HTMLElement | null
+  const isTextInput =
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLInputElement ||
+    target?.isContentEditable === true
+
+  if (modifier && event.key.toLowerCase() === 'a' && target instanceof HTMLTextAreaElement) {
+    event.preventDefault()
+    target.select()
+    return
+  }
+
   if (modifier && event.key === 'Enter' && state.loggedIn) {
     event.preventDefault()
     void sendMessage()
+    return
   }
 
-  if (modifier && event.key.toLowerCase() === 'o' && state.loggedIn) {
+  if (modifier && event.key.toLowerCase() === 'b' && state.loggedIn && !isTextInput) {
+    event.preventDefault()
+    toggleSidebar()
+    return
+  }
+
+  if (modifier && event.key.toLowerCase() === 'n' && state.loggedIn && !isTextInput) {
+    event.preventDefault()
+    createNewChat()
+    return
+  }
+
+  if (modifier && event.key.toLowerCase() === 'o' && state.loggedIn && !isTextInput) {
     event.preventDefault()
     void openFolder()
   }
@@ -816,29 +885,101 @@ export const App = (): TemplateResult => {
               </div>
             </div>
 
-            <div class="flex shrink-0 justify-center pb-6 pt-8">
+            <div class="flex shrink-0 justify-center pb-1 pt-8">
               <div
-                class="relative w-full max-w-[760px] rounded-[24px] border border-[#505050] bg-[#3a3a3a] px-[18px] py-5"
+                class="relative w-full max-w-[760px] rounded-[24px] border border-[#505050] bg-[#3a3a3a] px-[18px] pb-3 pt-2.5"
               >
                 <textarea
-                  class="h-[72px] w-full resize-none bg-transparent pr-14 text-[18px] font-medium leading-7 text-[#f5f5f5] outline-none placeholder:text-[#a3a3a3] disabled:cursor-not-allowed disabled:opacity-70"
+                  class="min-h-[74px] max-h-[210px] w-full resize-none overflow-y-hidden bg-transparent pb-1 text-[18px] font-medium leading-7 text-[#f5f5f5] outline-none placeholder:text-[#a3a3a3] disabled:cursor-not-allowed disabled:opacity-70"
+                  style="scrollbar-gutter: stable;"
                   placeholder=${hasWorkspace ? 'Build anything' : 'Open a folder to start'}
                   .value=${state.composer}
                   ?disabled=${!activeChat}
+                  ${ref((element?: Element | null) => {
+                    composerTextarea = element instanceof HTMLTextAreaElement ? element : null
+                    queueMicrotask(syncComposerHeight)
+                  })}
                   @input=${(event: Event) => {
                     setComposer((event.target as HTMLTextAreaElement).value)
                   }}
                 ></textarea>
 
-                <button
-                  type="button"
-                  class="absolute bottom-3 right-3 flex h-11 w-11 items-center justify-center rounded-full bg-white text-black transition-colors hover:bg-[#e5e5e5] disabled:cursor-not-allowed disabled:opacity-50"
-                  title=${isSending
-                    ? 'Assistant responding. This becomes a stop control.'
-                    : 'Send message'}
-                  ?disabled=${(!state.composer.trim() || !activeChat) && !isSending}
-                  @click=${() => void sendMessage()}
-                >
+                <div class="mt-1.5 flex items-center justify-between gap-3 pt-1.5">
+                  <div class="flex min-w-0 flex-wrap items-center gap-2">
+                    <div class="relative">
+                      <label class="sr-only" for="model-select">Model</label>
+                      <select
+                        id="model-select"
+                        class="max-w-[220px] appearance-none rounded-full border border-[#5a5a5a] bg-[#323232] px-4 py-2 pr-9 text-sm font-medium lowercase text-[#f1f1f1] outline-none transition-colors hover:border-[#6b6b6b] disabled:cursor-not-allowed disabled:opacity-50"
+                        .value=${state.selectedModelId}
+                        ?disabled=${!activeChat || state.models.length === 0 || isSending}
+                        @change=${(event: Event) => {
+                          setSelectedModelId((event.target as HTMLSelectElement).value)
+                        }}
+                      >
+                        ${state.models.map(
+                          (model) => html`<option class="lowercase" value=${model.id}>${model.name}</option>`
+                        )}
+                      </select>
+                      <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#a3a3a3]">
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <path d="m6 9 6 6 6-6" />
+                        </svg>
+                      </div>
+                    </div>
+
+                    <div class="relative">
+                      <label class="sr-only" for="thinking-select">Thinking level</label>
+                      <select
+                        id="thinking-select"
+                        class="max-w-[170px] appearance-none rounded-full border border-[#5a5a5a] bg-[#323232] px-4 py-2 pr-9 text-sm font-medium lowercase text-[#f1f1f1] outline-none transition-colors hover:border-[#6b6b6b] disabled:cursor-not-allowed disabled:opacity-50"
+                        .value=${state.selectedThinkingLevel}
+                        ?disabled=${!activeChat || isSending}
+                        @change=${(event: Event) => {
+                          setSelectedThinkingLevel((event.target as HTMLSelectElement).value as ThinkingLevel)
+                        }}
+                      >
+                        ${THINKING_LEVELS.map(
+                          (level) => html`<option class="lowercase" value=${level.id}>${level.label}</option>`
+                        )}
+                      </select>
+                      <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#a3a3a3]">
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <path d="m6 9 6 6 6-6" />
+                        </svg>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    class="shrink-0 flex h-11 w-11 items-center justify-center rounded-full bg-white text-black transition-colors hover:bg-[#e5e5e5] disabled:cursor-not-allowed disabled:opacity-50"
+                    title=${isSending
+                      ? 'Assistant responding. This becomes a stop control.'
+                      : 'Send message'}
+                    ?disabled=${(!state.composer.trim() || !activeChat) && !isSending}
+                    @click=${() => void sendMessage()}
+                  >
                   ${isSending
                     ? html`
                         <svg

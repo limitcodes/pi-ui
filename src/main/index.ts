@@ -25,6 +25,8 @@ type ModelOption = {
   name: string
 }
 
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
 type StreamEvent =
   | { type: 'start'; chatId: string; requestId: string }
   | { type: 'delta'; chatId: string; requestId: string; delta: string }
@@ -40,11 +42,25 @@ const emitStreamEvent = (payload: StreamEvent): void => {
   mainWindow?.webContents.send('agent:stream-event', payload)
 }
 
+const compareModels = (left: ModelOption, right: ModelOption): number => {
+  const byName = right.name.localeCompare(left.name, undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  })
+  if (byName !== 0) return byName
+
+  return right.id.localeCompare(left.id, undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  })
+}
+
 const getCodexModels = (): ModelOption[] => {
   return modelRegistry
     .getAll()
     .filter((model) => model.provider === 'openai-codex')
     .map((model) => ({ id: model.id, name: model.name }))
+    .sort(compareModels)
 }
 
 const getAuthState = (): { loggedIn: boolean; models: ModelOption[]; defaultModelId: string } => {
@@ -104,7 +120,8 @@ const extractAssistantText = (messages: unknown[]): string => {
 const getOrCreateSession = async (
   chatId: string,
   cwd: string,
-  modelId: string
+  modelId: string,
+  thinkingLevel: ThinkingLevel
 ): Promise<PiSession> => {
   if (!authStorage.has('openai-codex')) {
     throw new Error('Log in with ChatGPT Plus/Pro before starting a chat.')
@@ -120,6 +137,7 @@ const getOrCreateSession = async (
     if (cached.model?.id !== model.id || cached.model?.provider !== model.provider) {
       await cached.setModel(model)
     }
+    cached.setThinkingLevel(thinkingLevel)
     return cached
   }
 
@@ -132,6 +150,7 @@ const getOrCreateSession = async (
     sessionManager: SessionManager.inMemory()
   })
 
+  session.setThinkingLevel(thinkingLevel)
   sessionCache.set(chatId, session)
   return session
 }
@@ -141,9 +160,10 @@ const streamPrompt = async (
   cwd: string,
   prompt: string,
   modelId: string,
+  thinkingLevel: ThinkingLevel,
   requestId: string
 ): Promise<void> => {
-  const session = await getOrCreateSession(chatId, cwd, modelId)
+  const session = await getOrCreateSession(chatId, cwd, modelId, thinkingLevel)
   let text = ''
 
   emitStreamEvent({ type: 'start', chatId, requestId })
@@ -252,10 +272,26 @@ app.whenReady().then(() => {
 
   ipcMain.handle(
     'agent:send-message',
-    async (_event, payload: { chatId: string; cwd: string; prompt: string; modelId: string }) => {
+    async (
+      _event,
+      payload: {
+        chatId: string
+        cwd: string
+        prompt: string
+        modelId: string
+        thinkingLevel: ThinkingLevel
+      }
+    ) => {
       try {
         const requestId = `${payload.chatId}-${Date.now()}`
-        void streamPrompt(payload.chatId, payload.cwd, payload.prompt, payload.modelId, requestId)
+        void streamPrompt(
+          payload.chatId,
+          payload.cwd,
+          payload.prompt,
+          payload.modelId,
+          payload.thinkingLevel,
+          requestId
+        )
         return { ok: true as const, requestId }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)

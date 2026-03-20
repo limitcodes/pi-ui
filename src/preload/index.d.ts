@@ -1,5 +1,7 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
 
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
 interface AuthState {
   loggedIn: boolean
   models: Array<{ id: string; name: string }>
@@ -21,6 +23,7 @@ interface PiDesktopApi {
     cwd: string
     prompt: string
     modelId: string
+    thinkingLevel: ThinkingLevel
   }) => Promise<{ ok: true; requestId: string } | { ok: false; error: string }>
   onAgentStreamEvent: (listener: (event: AgentStreamEvent) => void) => () => void
 }
