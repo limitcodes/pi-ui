@@ -13,6 +13,7 @@ const scrollToBottom = (): DirectiveResult => {
   })
 }
 import { icon } from '@mariozechner/mini-lit/dist/icons.js'
+import { Select } from '@mariozechner/mini-lit/dist/Select.js'
 import {
   Folder,
   FolderOpen,
@@ -43,9 +44,43 @@ const THINKING_LEVELS: Array<{ id: ThinkingLevel; label: string }> = [
 
 type AgentStreamEvent =
   | { type: 'start'; chatId: string; requestId: string }
-  | { type: 'delta'; chatId: string; requestId: string; delta: string }
+  | { type: 'text_delta'; chatId: string; requestId: string; delta: string }
+  | { type: 'thinking_delta'; chatId: string; requestId: string; delta: string }
+  | {
+      type: 'tool_start'
+      chatId: string
+      requestId: string
+      toolCallId: string
+      toolName: string
+      argsText: string
+    }
+  | {
+      type: 'tool_update'
+      chatId: string
+      requestId: string
+      toolCallId: string
+      toolName: string
+      output: string
+    }
+  | {
+      type: 'tool_end'
+      chatId: string
+      requestId: string
+      toolCallId: string
+      toolName: string
+      output: string
+      isError: boolean
+    }
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
+
+interface ToolInvocation {
+  id: string
+  name: string
+  argsText: string
+  output: string
+  status: 'running' | 'done' | 'error'
+}
 
 interface Message {
   id: string
@@ -53,6 +88,8 @@ interface Message {
   content: string
   createdAt: number
   streaming?: boolean
+  thinking?: string
+  tools?: ToolInvocation[]
 }
 
 interface Workspace {
@@ -93,7 +130,7 @@ interface AppState extends PersistedState {
   expandedWorkspaces: Set<string>
 }
 
-const STORAGE_KEY = 'pi-ui.chats.v4'
+const STORAGE_KEY = 'pi-ui.chats.v5'
 const DEFAULT_WORKSPACE_PATH = '__no-folder__'
 
 const now = (): number => Date.now()
@@ -164,7 +201,29 @@ const loadState = (): AppState => {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<PersistedState>
       const workspaces = Array.isArray(parsed.workspaces) ? parsed.workspaces : []
-      const chats = Array.isArray(parsed.chats) ? sortChats(parsed.chats) : []
+      const chats = Array.isArray(parsed.chats)
+        ? sortChats(
+            parsed.chats.map((chat) => ({
+              ...chat,
+              messages: Array.isArray(chat.messages)
+                ? chat.messages.map((message) => ({
+                    ...message,
+                    thinking: typeof message.thinking === 'string' ? message.thinking : '',
+                    tools: Array.isArray(message.tools)
+                      ? message.tools.map((tool) => ({
+                          id: String(tool.id ?? createId()),
+                          name: typeof tool.name === 'string' ? tool.name : 'tool',
+                          argsText: typeof tool.argsText === 'string' ? tool.argsText : '',
+                          output: typeof tool.output === 'string' ? tool.output : '',
+                          status:
+                            tool.status === 'done' || tool.status === 'error' ? tool.status : 'running'
+                        }))
+                      : []
+                  }))
+                : []
+            }))
+          )
+        : []
       const activeWorkspacePath =
         parsed.activeWorkspacePath &&
         workspaces.some((workspace) => workspace.path === parsed.activeWorkspacePath)
@@ -238,6 +297,41 @@ const syncComposerHeight = (): void => {
   composerTextarea.style.overflowY = composerTextarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
 }
 
+const updateAssistantMessage = (
+  current: AppState,
+  chatId: string,
+  updater: (message: Message) => Message
+): AppState => {
+  return {
+    ...current,
+    chats: sortChats(
+      current.chats.map((chat) => {
+        if (chat.id !== chatId) return chat
+        return {
+          ...chat,
+          messages: chat.messages.map((message) =>
+            message.id === current.activeAssistantMessageId ? updater(message) : message
+          ),
+          updatedAt: now()
+        }
+      })
+    )
+  }
+}
+
+const upsertToolInvocation = (
+  tools: ToolInvocation[],
+  toolId: string,
+  updater: (tool: ToolInvocation | undefined) => ToolInvocation
+): ToolInvocation[] => {
+  const index = tools.findIndex((tool) => tool.id === toolId)
+  if (index === -1) {
+    return [...tools, updater(undefined)]
+  }
+
+  return tools.map((tool, currentIndex) => (currentIndex === index ? updater(tool) : tool))
+}
+
 export const setAppChangeListener = (listener: () => void): void => {
   notifyChange = listener
 }
@@ -256,73 +350,90 @@ export const setStreamCleanup = (
         return current
       }
 
-      if (event.type === 'delta') {
-        return {
-          ...current,
-          chats: sortChats(
-            current.chats.map((chat) => {
-              if (chat.id !== event.chatId) return chat
-              return {
-                ...chat,
-                messages: chat.messages.map((message) =>
-                  message.id === current.activeAssistantMessageId
-                    ? { ...message, content: message.content + event.delta, streaming: true }
-                    : message
-                ),
-                updatedAt: now()
-              }
-            })
-          )
-        }
+      if (event.type === 'text_delta') {
+        return updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          content: message.content + event.delta,
+          streaming: true
+        }))
+      }
+
+      if (event.type === 'thinking_delta') {
+        return updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          thinking: (message.thinking ?? '') + event.delta,
+          streaming: true
+        }))
+      }
+
+      if (event.type === 'tool_start') {
+        return updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          tools: upsertToolInvocation(message.tools ?? [], event.toolCallId, (tool) => ({
+            id: event.toolCallId,
+            name: event.toolName,
+            argsText: tool?.argsText || event.argsText,
+            output: tool?.output ?? '',
+            status: 'running'
+          })),
+          streaming: true
+        }))
+      }
+
+      if (event.type === 'tool_update') {
+        return updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          tools: upsertToolInvocation(message.tools ?? [], event.toolCallId, (tool) => ({
+            id: event.toolCallId,
+            name: event.toolName,
+            argsText: tool?.argsText ?? '',
+            output: event.output,
+            status: 'running'
+          })),
+          streaming: true
+        }))
+      }
+
+      if (event.type === 'tool_end') {
+        return updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          tools: upsertToolInvocation(message.tools ?? [], event.toolCallId, (tool) => ({
+            id: event.toolCallId,
+            name: event.toolName,
+            argsText: tool?.argsText ?? '',
+            output: event.output || tool?.output || '',
+            status: event.isError ? 'error' : 'done'
+          })),
+          streaming: true
+        }))
       }
 
       if (event.type === 'end') {
         return {
-          ...current,
+          ...updateAssistantMessage(current, event.chatId, (message) => ({
+            ...message,
+            streaming: false
+          })),
           sendingChatId: null,
           activeRequestId: null,
-          activeAssistantMessageId: null,
-          chats: sortChats(
-            current.chats.map((chat) => {
-              if (chat.id !== event.chatId) return chat
-              return {
-                ...chat,
-                messages: chat.messages.map((message) =>
-                  message.id === current.activeAssistantMessageId
-                    ? { ...message, streaming: false }
-                    : message
-                ),
-                updatedAt: now()
-              }
-            })
-          )
+          activeAssistantMessageId: null
         }
       }
 
-      return {
-        ...current,
-        sendingChatId: null,
-        activeRequestId: null,
-        activeAssistantMessageId: null,
-        chats: sortChats(
-          current.chats.map((chat) => {
-            if (chat.id !== event.chatId) return chat
-            return {
-              ...chat,
-              messages: chat.messages.map((message) =>
-                message.id === current.activeAssistantMessageId
-                  ? {
-                      ...message,
-                      content: message.content || `Agent error: ${event.error}`,
-                      streaming: false
-                    }
-                  : message
-              ),
-              updatedAt: now()
-            }
-          })
-        )
+      if (event.type === 'error') {
+        return {
+          ...updateAssistantMessage(current, event.chatId, (message) => ({
+            ...message,
+            content: message.content || `Agent error: ${event.error}`,
+            streaming: false
+          })),
+          sendingChatId: null,
+          activeRequestId: null,
+          activeAssistantMessageId: null
+        }
       }
+
+      return current
     })
   })
 }
@@ -343,7 +454,15 @@ const persistState = (): void => {
             id: message.id,
             role: message.role,
             content: message.content,
-            createdAt: message.createdAt
+            createdAt: message.createdAt,
+            thinking: message.thinking ?? '',
+            tools: (message.tools ?? []).map((tool) => ({
+              id: tool.id,
+              name: tool.name,
+              argsText: tool.argsText,
+              output: tool.output,
+              status: tool.status
+            }))
           }))
         })),
         activeWorkspacePath: state.activeWorkspacePath,
@@ -555,7 +674,9 @@ const sendMessage = async (): Promise<void> => {
     role: 'assistant',
     content: '',
     createdAt: now(),
-    streaming: true
+    streaming: true,
+    thinking: '',
+    tools: []
   }
 
   updateState((current) => ({
@@ -782,14 +903,89 @@ const renderNoWorkspaceState = (): TemplateResult => {
   `
 }
 
+const renderToolInvocation = (tool: ToolInvocation): TemplateResult => {
+  const statusTone = tool.status === 'error' ? 'text-[#f28b82]' : 'text-[#8f8f8f]'
+  const statusLabel = tool.status === 'error' ? 'error' : tool.status === 'running' ? 'running' : ''
+
+  return html`
+    <details class="overflow-hidden" ?open=${false}>
+      <summary class="flex cursor-pointer list-none items-center gap-1.5 py-1 select-none marker:hidden text-[#8f8f8f]">
+        <span class="text-[13px] font-medium text-[#f5f5f5]">${tool.name}</span>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="shrink-0 transition-transform details-arrow"
+        >
+          <path d="m6 9 6 6 6-6" />
+        </svg>
+        ${statusLabel
+          ? html`<span class=${['text-[12px] font-medium', statusTone].join(' ')}>${statusLabel}</span>`
+          : ''}
+      </summary>
+      <div class="pt-2">
+        ${tool.argsText
+          ? html`<pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-[#2d2d2d] px-3 py-2 text-xs leading-5 text-[#bdbdbd]">${tool.argsText}</pre>`
+          : ''}
+        ${tool.output
+          ? html`<pre class="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-[#2a2a2a] px-3 py-2 text-xs leading-5 text-[#d8d8d8]">${tool.output}</pre>`
+          : tool.status === 'running'
+            ? html`<div class="mt-3 text-xs text-[#8f8f8f]">Waiting for output…</div>`
+            : ''}
+      </div>
+    </details>
+  `
+}
+
 const renderMessage = (message: Message): TemplateResult => {
   const isAssistant = message.role === 'assistant'
+  const hasThinking = Boolean(message.thinking?.trim())
+  const tools = message.tools ?? []
+
   return html`
     <div class=${['flex w-full', isAssistant ? 'justify-start' : 'justify-end'].join(' ')}>
       ${isAssistant
         ? html`
-            <div class="max-w-[520px] text-[15px] leading-[1.55] text-[#f5f5f5]">
-              <p class="whitespace-pre-wrap break-words text-[#f5f5f5]">${message.content}</p>
+            <div class="max-w-[640px] space-y-3 text-[15px] leading-[1.55] text-[#f5f5f5]">
+              ${hasThinking
+                ? html`
+                    <details class="overflow-hidden" ?open=${message.streaming && !message.content}>
+                      <summary class="flex cursor-pointer list-none items-center gap-1.5 py-1 select-none marker:hidden text-[#8f8f8f]">
+                        <span class="text-[13px] font-medium">Thinking</span>
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          class="shrink-0 transition-transform details-arrow"
+                        >
+                          <path d="m6 9 6 6 6-6" />
+                        </svg>
+                      </summary>
+                      <div class="pt-2">
+                        <markdown-block .content=${message.thinking}></markdown-block>
+                      </div>
+                    </details>
+                  `
+                : ''}
+
+              ${tools.length > 0 ? html`<div class="space-y-1">${tools.map((tool) => renderToolInvocation(tool))}</div>` : ''}
+
+              ${message.content
+                ? html`<markdown-block .content=${message.content}></markdown-block>`
+                : ''}
+
               ${message.streaming
                 ? html`
                     <div class="mt-2 flex items-center gap-2 text-xs text-[#8f8f8f]">
@@ -804,7 +1000,7 @@ const renderMessage = (message: Message): TemplateResult => {
             <div
               class="max-w-[360px] rounded-2xl bg-[#434343] px-4 py-3 text-[15px] leading-[1.45] text-[#f5f5f5]"
             >
-              <p class="whitespace-pre-wrap break-words">${message.content}</p>
+              <markdown-block .content=${message.content}></markdown-block>
             </div>
           `}
     </div>
@@ -906,74 +1102,36 @@ export const App = (): TemplateResult => {
 
                 <div class="mt-1.5 flex items-center justify-between gap-3 pt-1.5">
                   <div class="flex min-w-0 flex-wrap items-center gap-2">
-                    <div class="relative">
-                      <label class="sr-only" for="model-select">Model</label>
-                      <select
-                        id="model-select"
-                        class="max-w-[220px] appearance-none rounded-full border border-[#5a5a5a] bg-[#323232] px-4 py-2 pr-9 text-sm font-medium lowercase text-[#f1f1f1] outline-none transition-colors hover:border-[#6b6b6b] disabled:cursor-not-allowed disabled:opacity-50"
-                        .value=${state.selectedModelId}
-                        ?disabled=${!activeChat || state.models.length === 0 || isSending}
-                        @change=${(event: Event) => {
-                          setSelectedModelId((event.target as HTMLSelectElement).value)
-                        }}
-                      >
-                        ${state.models.map(
-                          (model) => html`<option class="lowercase" value=${model.id}>${model.name}</option>`
-                        )}
-                      </select>
-                      <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#a3a3a3]">
-                        <svg
-                          xmlns="http://www.w3.org/2000/svg"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                        >
-                          <path d="m6 9 6 6 6-6" />
-                        </svg>
-                      </div>
-                    </div>
+                    ${Select({
+                      variant: 'ghost',
+                      value: state.selectedModelId,
+                      placeholder: 'Model',
+                      options: state.models.map((model) => ({ value: model.id, label: model.name })),
+                      onChange: (value) => {
+                        setSelectedModelId(value)
+                      },
+                      disabled: !activeChat || state.models.length === 0 || isSending,
+                      width: '220px',
+                      size: 'md'
+                    })}
 
-                    <div class="relative">
-                      <label class="sr-only" for="thinking-select">Thinking level</label>
-                      <select
-                        id="thinking-select"
-                        class="max-w-[170px] appearance-none rounded-full border border-[#5a5a5a] bg-[#323232] px-4 py-2 pr-9 text-sm font-medium lowercase text-[#f1f1f1] outline-none transition-colors hover:border-[#6b6b6b] disabled:cursor-not-allowed disabled:opacity-50"
-                        .value=${state.selectedThinkingLevel}
-                        ?disabled=${!activeChat || isSending}
-                        @change=${(event: Event) => {
-                          setSelectedThinkingLevel((event.target as HTMLSelectElement).value as ThinkingLevel)
-                        }}
-                      >
-                        ${THINKING_LEVELS.map(
-                          (level) => html`<option class="lowercase" value=${level.id}>${level.label}</option>`
-                        )}
-                      </select>
-                      <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#a3a3a3]">
-                        <svg
-                          xmlns="http://www.w3.org/2000/svg"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                        >
-                          <path d="m6 9 6 6 6-6" />
-                        </svg>
-                      </div>
-                    </div>
+                    ${Select({
+                      variant: 'ghost',
+                      value: state.selectedThinkingLevel,
+                      placeholder: 'Thinking',
+                      options: THINKING_LEVELS.map((level) => ({ value: level.id, label: level.label })),
+                      onChange: (value) => {
+                        setSelectedThinkingLevel(value as ThinkingLevel)
+                      },
+                      disabled: !activeChat || isSending,
+                      width: '170px',
+                      size: 'md'
+                    })}
                   </div>
 
                   <button
                     type="button"
-                    class="shrink-0 flex h-11 w-11 items-center justify-center rounded-full bg-white text-black transition-colors hover:bg-[#e5e5e5] disabled:cursor-not-allowed disabled:opacity-50"
+                    class="shrink-0 flex h-11 w-11 items-center justify-center bg-transparent text-white disabled:cursor-not-allowed disabled:opacity-50"
                     title=${isSending
                       ? 'Assistant responding. This becomes a stop control.'
                       : 'Send message'}
@@ -995,17 +1153,13 @@ export const App = (): TemplateResult => {
                     : html`
                         <svg
                           xmlns="http://www.w3.org/2000/svg"
-                          width="20"
-                          height="20"
+                          width="32"
+                          height="32"
                           viewBox="0 0 24 24"
                           fill="currentColor"
+                          aria-hidden="true"
                         >
-                          <path
-                            d="M21.864 3.549L15.41 21.417a1.55 1.55 0 0 1-1.41.903a1.54 1.54 0 0 1-1.394-.874l-2.88-5.759zM20.45 2.135L8.311 14.273l-5.728-2.864A1.55 1.55 0 0 1 1.68 10c0-.606.353-1.157.981-1.44z"
-                          />
-                          <path
-                            d="M21.864 3.549L15.41 21.417a1.55 1.55 0 0 1-1.41.903a1.54 1.54 0 0 1-1.394-.874l-2.88-5.759z"
-                          />
+                          <path d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12.02 7l-.163.01l-.086.016l-.142.045l-.113.054l-.07.043l-.095.071l-.058.054l-4 4l-.083.094a1 1 0 0 0 1.497 1.32L11 10.414V16l.007.117A1 1 0 0 0 13 16v-5.585l2.293 2.292l.094.083a1 1 0 0 0 1.32-1.497l-4-4l-.082-.073l-.089-.064l-.113-.062l-.081-.034l-.113-.034l-.112-.02z" />
                         </svg>
                       `}
                 </button>

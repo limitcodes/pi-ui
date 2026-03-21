@@ -4,6 +4,8 @@ import '@mariozechner/mini-lit/dist/MarkdownBlock.js'
 import { render } from 'lit'
 import { App, setAppChangeListener, setStreamCleanup } from './App'
 
+document.documentElement.classList.add('dark')
+
 const container = document.getElementById('root')
 
 if (!container) {

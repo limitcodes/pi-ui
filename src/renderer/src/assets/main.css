@@ -46,7 +46,15 @@ textarea {
 }
 
 textarea::selection,
-input::selection {
+input::selection,
+markdown-block::selection,
+markdown-block *::selection,
+p::selection,
+span::selection,
+pre::selection,
+code::selection,
+summary::selection,
+div::selection {
   background: rgba(255, 255, 255, 0.28);
   color: #ffffff;
 }
@@ -127,4 +135,12 @@ markdown-block,
 markdown-block .markdown-content,
 markdown-block .markdown-content * {
   color: #f5f5f5;
+}
+
+details[open] > summary .details-arrow {
+  transform: rotate(180deg);
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
 }

@@ -12,12 +12,18 @@ import icon from '../../resources/icon.png?asset'
 
 type PiSession = Awaited<ReturnType<typeof createAgentSession>>['session']
 
-type MessageUpdateEvent = {
+type SessionEvent = {
   type?: string
   assistantMessageEvent?: {
     type?: string
     delta?: string
   }
+  toolCallId?: string
+  toolName?: string
+  args?: unknown
+  partialResult?: unknown
+  result?: unknown
+  isError?: boolean
 }
 
 type ModelOption = {
@@ -29,7 +35,33 @@ type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
 type StreamEvent =
   | { type: 'start'; chatId: string; requestId: string }
-  | { type: 'delta'; chatId: string; requestId: string; delta: string }
+  | { type: 'text_delta'; chatId: string; requestId: string; delta: string }
+  | { type: 'thinking_delta'; chatId: string; requestId: string; delta: string }
+  | {
+      type: 'tool_start'
+      chatId: string
+      requestId: string
+      toolCallId: string
+      toolName: string
+      argsText: string
+    }
+  | {
+      type: 'tool_update'
+      chatId: string
+      requestId: string
+      toolCallId: string
+      toolName: string
+      output: string
+    }
+  | {
+      type: 'tool_end'
+      chatId: string
+      requestId: string
+      toolCallId: string
+      toolName: string
+      output: string
+      isError: boolean
+    }
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
 
@@ -92,6 +124,50 @@ const loginCodex = async (): Promise<void> => {
     },
     onPrompt: async ({ message }) => promptInRenderer(message)
   })
+}
+
+const safeStringify = (value: unknown): string => {
+  if (typeof value === 'string') return value
+  if (value === undefined) return ''
+
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+const extractTextFromToolPayload = (value: unknown): string => {
+  if (typeof value === 'string') return value
+  if (!value || typeof value !== 'object') return safeStringify(value)
+
+  const record = value as {
+    content?: Array<{ type?: string; text?: string; content?: string }>
+    stdout?: string
+    stderr?: string
+    output?: string
+  }
+
+  if (typeof record.stdout === 'string' || typeof record.stderr === 'string') {
+    return [record.stdout, record.stderr].filter(Boolean).join(record.stdout && record.stderr ? '\n' : '')
+  }
+
+  if (typeof record.output === 'string') return record.output
+
+  if (Array.isArray(record.content)) {
+    const text = record.content
+      .map((part) => {
+        if (typeof part?.text === 'string') return part.text
+        if (typeof part?.content === 'string') return part.content
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+
+    if (text) return text
+  }
+
+  return safeStringify(value)
 }
 
 const extractAssistantText = (messages: unknown[]): string => {
@@ -169,11 +245,61 @@ const streamPrompt = async (
   emitStreamEvent({ type: 'start', chatId, requestId })
 
   const unsubscribe = session.subscribe((event: unknown) => {
-    const update = event as MessageUpdateEvent
-    if (update.type === 'message_update' && update.assistantMessageEvent?.type === 'text_delta') {
-      const delta = update.assistantMessageEvent.delta ?? ''
-      text += delta
-      emitStreamEvent({ type: 'delta', chatId, requestId, delta })
+    const update = event as SessionEvent
+
+    if (update.type === 'message_update') {
+      if (update.assistantMessageEvent?.type === 'text_delta') {
+        const delta = update.assistantMessageEvent.delta ?? ''
+        text += delta
+        emitStreamEvent({ type: 'text_delta', chatId, requestId, delta })
+      }
+
+      if (update.assistantMessageEvent?.type === 'thinking_delta') {
+        emitStreamEvent({
+          type: 'thinking_delta',
+          chatId,
+          requestId,
+          delta: update.assistantMessageEvent.delta ?? ''
+        })
+      }
+
+      return
+    }
+
+    if (update.type === 'tool_execution_start') {
+      emitStreamEvent({
+        type: 'tool_start',
+        chatId,
+        requestId,
+        toolCallId: update.toolCallId ?? `${requestId}-tool-start`,
+        toolName: update.toolName ?? 'tool',
+        argsText: safeStringify(update.args)
+      })
+      return
+    }
+
+    if (update.type === 'tool_execution_update') {
+      emitStreamEvent({
+        type: 'tool_update',
+        chatId,
+        requestId,
+        toolCallId: update.toolCallId ?? `${requestId}-tool-update`,
+        toolName: update.toolName ?? 'tool',
+        output: extractTextFromToolPayload(update.partialResult)
+      })
+      return
+    }
+
+    if (update.type === 'tool_execution_end') {
+      emitStreamEvent({
+        type: 'tool_end',
+        chatId,
+        requestId,
+        toolCallId: update.toolCallId ?? `${requestId}-tool-end`,
+        toolName: update.toolName ?? 'tool',
+        output: extractTextFromToolPayload(update.result),
+        isError: Boolean(update.isError)
+      })
     }
   })
 
@@ -182,7 +308,7 @@ const streamPrompt = async (
     if (!text.trim()) {
       const fallback = extractAssistantText(session.messages as unknown[])
       if (fallback) {
-        emitStreamEvent({ type: 'delta', chatId, requestId, delta: fallback })
+        emitStreamEvent({ type: 'text_delta', chatId, requestId, delta: fallback })
       }
     }
     emitStreamEvent({ type: 'end', chatId, requestId })
