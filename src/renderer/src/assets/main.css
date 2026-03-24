@@ -144,3 +144,13 @@ details[open] > summary .details-arrow {
 details > summary::-webkit-details-marker {
   display: none;
 }
+
+.terminal-dock .xterm {
+  height: 100%;
+}
+
+.terminal-dock .xterm-viewport,
+.terminal-dock .xterm-screen,
+.terminal-dock .xterm-helpers {
+  border-radius: 0;
+}

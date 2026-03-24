@@ -41,6 +41,20 @@ type AgentStreamEvent =
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
 
+type TerminalSessionSummary = {
+  id: string
+  title: string
+  cwd: string
+  shell: string
+  pid: number
+  status: 'running' | 'exited'
+  exitCode: number | null
+}
+
+type TerminalEvent =
+  | { type: 'output'; terminalId: string; data: string }
+  | { type: 'exit'; terminalId: string; exitCode: number | null }
+
 const api = {
   getAuthState: async (): Promise<AuthState> => {
     return ipcRenderer.invoke('auth:get-state')
@@ -68,6 +82,41 @@ const api = {
     ipcRenderer.on('agent:stream-event', wrapped)
     return () => {
       ipcRenderer.removeListener('agent:stream-event', wrapped)
+    }
+  },
+  listTerminals: async (): Promise<TerminalSessionSummary[]> => {
+    return ipcRenderer.invoke('terminal:list')
+  },
+  createTerminal: async (payload: {
+    cwd?: string
+    title?: string
+  }): Promise<{ ok: true; terminal: TerminalSessionSummary } | { ok: false; error: string }> => {
+    return ipcRenderer.invoke('terminal:create', payload)
+  },
+  writeTerminal: async (payload: {
+    terminalId: string
+    data: string
+  }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    return ipcRenderer.invoke('terminal:write', payload)
+  },
+  resizeTerminal: async (payload: {
+    terminalId: string
+    cols: number
+    rows: number
+  }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    return ipcRenderer.invoke('terminal:resize', payload)
+  },
+  closeTerminal: async (payload: {
+    terminalId: string
+  }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    return ipcRenderer.invoke('terminal:close', payload)
+  },
+  onTerminalEvent: (listener: (event: TerminalEvent) => void): (() => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, payload: TerminalEvent): void =>
+      listener(payload)
+    ipcRenderer.on('terminal:event', wrapped)
+    return () => {
+      ipcRenderer.removeListener('terminal:event', wrapped)
     }
   }
 }

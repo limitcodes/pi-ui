@@ -25,8 +25,11 @@
     "@electron-toolkit/utils": "^4.0.0",
     "@mariozechner/mini-lit": "^0.2.1",
     "@mariozechner/pi-coding-agent": "^0.60.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "lit": "^3.3.2",
-    "lucide": "^0.544.0"
+    "lucide": "^0.544.0",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@electron-toolkit/eslint-config-prettier": "^3.0.0",
@@ -45,7 +48,8 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "electron",
-      "esbuild"
+      "esbuild",
+      "node-pty"
     ]
   }
 }

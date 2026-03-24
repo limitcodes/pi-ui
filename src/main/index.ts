@@ -1,6 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions } from 'electron'
 import { basename, join } from 'path'
+import { homedir } from 'os'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
+import { spawn, type IPty } from 'node-pty'
 import {
   AuthStorage,
   createAgentSession,
@@ -32,6 +34,30 @@ type ModelOption = {
 }
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+type TerminalSessionSummary = {
+  id: string
+  title: string
+  cwd: string
+  shell: string
+  pid: number
+  status: 'running' | 'exited'
+  exitCode: number | null
+}
+
+type TerminalEvent =
+  | { type: 'output'; terminalId: string; data: string }
+  | { type: 'exit'; terminalId: string; exitCode: number | null }
+
+type TerminalRecord = {
+  id: string
+  title: string
+  cwd: string
+  shell: string
+  pty: IPty
+  status: 'running' | 'exited'
+  exitCode: number | null
+}
 
 type StreamEvent =
   | { type: 'start'; chatId: string; requestId: string }
@@ -69,9 +95,101 @@ let mainWindow: BrowserWindow | null = null
 const authStorage = AuthStorage.create(join(app.getPath('userData'), 'auth.json'))
 const modelRegistry = new ModelRegistry(authStorage)
 const sessionCache = new Map<string, PiSession>()
+const terminalSessions = new Map<string, TerminalRecord>()
+let terminalSequence = 0
 
 const emitStreamEvent = (payload: StreamEvent): void => {
   mainWindow?.webContents.send('agent:stream-event', payload)
+}
+
+const emitTerminalEvent = (payload: TerminalEvent): void => {
+  mainWindow?.webContents.send('terminal:event', payload)
+}
+
+const toTerminalSummary = (terminal: TerminalRecord): TerminalSessionSummary => ({
+  id: terminal.id,
+  title: terminal.title,
+  cwd: terminal.cwd,
+  shell: terminal.shell,
+  pid: terminal.pty.pid,
+  status: terminal.status,
+  exitCode: terminal.exitCode
+})
+
+const getDefaultShell = (): string => {
+  if (process.platform === 'win32') {
+    return process.env.COMSPEC || 'powershell.exe'
+  }
+
+  return process.env.SHELL || '/bin/bash'
+}
+
+const getShellArgs = (shellPath: string): string[] => {
+  if (process.platform === 'win32') {
+    return []
+  }
+
+  const executable = basename(shellPath).toLowerCase()
+  if (executable === 'fish') return ['-l']
+  return ['-l']
+}
+
+const createTerminalSession = ({
+  cwd,
+  title
+}: {
+  cwd?: string
+  title?: string
+}): TerminalSessionSummary => {
+  const shell = getDefaultShell()
+  const resolvedCwd = cwd || homedir()
+  const id = `terminal-${Date.now()}-${terminalSequence++}`
+  const terminal = spawn(shell, getShellArgs(shell), {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 32,
+    cwd: resolvedCwd,
+    env: {
+      ...process.env,
+      TERM: 'xterm-256color',
+      COLORTERM: 'truecolor'
+    }
+  })
+
+  const record: TerminalRecord = {
+    id,
+    title: title?.trim() || `Terminal ${terminalSessions.size + 1}`,
+    cwd: resolvedCwd,
+    shell,
+    pty: terminal,
+    status: 'running',
+    exitCode: null
+  }
+
+  terminal.onData((data) => {
+    emitTerminalEvent({ type: 'output', terminalId: id, data })
+  })
+
+  terminal.onExit(({ exitCode }) => {
+    const current = terminalSessions.get(id)
+    if (!current) return
+
+    current.status = 'exited'
+    current.exitCode = exitCode
+    emitTerminalEvent({ type: 'exit', terminalId: id, exitCode })
+    terminalSessions.delete(id)
+  })
+
+  terminalSessions.set(id, record)
+  return toTerminalSummary(record)
+}
+
+const killTerminalSession = (terminalId: string): void => {
+  const terminal = terminalSessions.get(terminalId)
+  if (!terminal) return
+
+  terminal.pty.kill()
+  terminalSessions.delete(terminalId)
 }
 
 const compareModels = (left: ModelOption, right: ModelOption): number => {
@@ -426,6 +544,69 @@ app.whenReady().then(() => {
     }
   )
 
+  ipcMain.handle('terminal:list', async () =>
+    Array.from(terminalSessions.values()).map((terminal) => toTerminalSummary(terminal))
+  )
+
+  ipcMain.handle(
+    'terminal:create',
+    async (_event, payload: { cwd?: string; title?: string } | undefined) => {
+      try {
+        const terminal = createTerminalSession(payload ?? {})
+        return { ok: true as const, terminal }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false as const, error: message }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'terminal:write',
+    async (_event, payload: { terminalId: string; data: string }) => {
+      try {
+        const terminal = terminalSessions.get(payload.terminalId)
+        if (!terminal) {
+          throw new Error('Terminal not found')
+        }
+
+        terminal.pty.write(payload.data)
+        return { ok: true as const }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false as const, error: message }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'terminal:resize',
+    async (_event, payload: { terminalId: string; cols: number; rows: number }) => {
+      try {
+        const terminal = terminalSessions.get(payload.terminalId)
+        if (!terminal) {
+          throw new Error('Terminal not found')
+        }
+
+        terminal.pty.resize(Math.max(1, payload.cols), Math.max(1, payload.rows))
+        return { ok: true as const }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false as const, error: message }
+      }
+    }
+  )
+
+  ipcMain.handle('terminal:close', async (_event, payload: { terminalId: string }) => {
+    try {
+      killTerminalSession(payload.terminalId)
+      return { ok: true as const }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { ok: false as const, error: message }
+    }
+  })
+
   createWindow()
 
   app.on('activate', () => {
@@ -434,6 +615,10 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  for (const terminalId of terminalSessions.keys()) {
+    killTerminalSession(terminalId)
+  }
+
   if (process.platform !== 'darwin') {
     app.quit()
   }

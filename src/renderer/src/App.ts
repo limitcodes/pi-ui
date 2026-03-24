@@ -1,6 +1,9 @@
 import { html, type TemplateResult } from 'lit'
 import { ref } from 'lit/directives/ref.js'
+import { repeat } from 'lit/directives/repeat.js'
 import { type DirectiveResult } from 'lit/directive.js'
+import { FitAddon } from '@xterm/addon-fit'
+import { Terminal as XTerm } from '@xterm/xterm'
 
 // Custom directive to scroll to bottom of element
 const scrollToBottom = (): DirectiveResult => {
@@ -30,6 +33,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   SquarePen,
+  TerminalSquare,
   Trash2
 } from 'lucide'
 
@@ -82,6 +86,20 @@ type AgentStreamEvent =
     }
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
+
+type TerminalSessionSummary = {
+  id: string
+  title: string
+  cwd: string
+  shell: string
+  pid: number
+  status: 'running' | 'exited'
+  exitCode: number | null
+}
+
+type TerminalEvent =
+  | { type: 'output'; terminalId: string; data: string }
+  | { type: 'exit'; terminalId: string; exitCode: number | null }
 
 interface ToolInvocation {
   id: string
@@ -143,6 +161,9 @@ interface AppState extends PersistedState {
   sidebarCollapsed: boolean
   expandedWorkspaces: Set<string>
   deleteChatId: string | null
+  terminalDockOpen: boolean
+  terminalSessions: TerminalSessionSummary[]
+  activeTerminalId: string
 }
 
 const STORAGE_KEY = 'pi-ui.chats.v5'
@@ -231,7 +252,9 @@ const loadState = (): AppState => {
                           argsText: typeof tool.argsText === 'string' ? tool.argsText : '',
                           output: typeof tool.output === 'string' ? tool.output : '',
                           status:
-                            tool.status === 'done' || tool.status === 'error' ? tool.status : 'running'
+                            tool.status === 'done' || tool.status === 'error'
+                              ? tool.status
+                              : 'running'
                         }))
                       : []
                   }))
@@ -266,7 +289,10 @@ const loadState = (): AppState => {
         models: [],
         sidebarCollapsed: true,
         expandedWorkspaces: new Set<string>(),
-        deleteChatId: null
+        deleteChatId: null,
+        terminalDockOpen: false,
+        terminalSessions: [],
+        activeTerminalId: ''
       }
     }
   } catch (error) {
@@ -289,7 +315,10 @@ const loadState = (): AppState => {
     models: [],
     sidebarCollapsed: true,
     expandedWorkspaces: new Set<string>(),
-    deleteChatId: null
+    deleteChatId: null,
+    terminalDockOpen: false,
+    terminalSessions: [],
+    activeTerminalId: ''
   }
 }
 
@@ -297,8 +326,13 @@ let state = loadState()
 let notifyChange: (() => void) | undefined
 let folderPickerInFlight = false
 let unsubscribeStream: (() => void) | undefined
+let unsubscribeTerminal: (() => void) | undefined
 let composerTextarea: HTMLTextAreaElement | null = null
 let chatScrollContainer: HTMLDivElement | null = null
+const terminalInstances = new Map<string, { terminal: XTerm; fitAddon: FitAddon }>()
+const terminalMounts = new Map<string, HTMLDivElement>()
+const pendingTerminalOutput = new Map<string, string[]>()
+let terminalResizeTick: number | null = null
 
 const syncComposerHeight = (): void => {
   if (!composerTextarea) return
@@ -385,8 +419,161 @@ const upsertToolInvocation = (
   return tools.map((tool, currentIndex) => (currentIndex === index ? updater(tool) : tool))
 }
 
+const getActiveTerminal = (): TerminalSessionSummary | undefined => {
+  return state.terminalSessions.find((terminal) => terminal.id === state.activeTerminalId)
+}
+
+const scheduleTerminalFit = (): void => {
+  if (terminalResizeTick) {
+    window.clearTimeout(terminalResizeTick)
+  }
+
+  terminalResizeTick = window.setTimeout(() => {
+    terminalResizeTick = null
+    const activeTerminal = getActiveTerminal()
+    if (!activeTerminal || !state.terminalDockOpen) return
+
+    const instance = terminalInstances.get(activeTerminal.id)
+    const mount = terminalMounts.get(activeTerminal.id)
+    if (!instance || !mount || mount.offsetParent === null) return
+
+    instance.fitAddon.fit()
+    void window.api.resizeTerminal({
+      terminalId: activeTerminal.id,
+      cols: instance.terminal.cols,
+      rows: instance.terminal.rows
+    })
+  }, 30)
+}
+
+const focusActiveTerminal = (): void => {
+  queueMicrotask(() => {
+    const activeTerminal = getActiveTerminal()
+    if (!activeTerminal || !state.terminalDockOpen) return
+    scheduleTerminalFit()
+    terminalInstances.get(activeTerminal.id)?.terminal.focus()
+  })
+}
+
+const flushPendingTerminalOutput = (terminalId: string): void => {
+  const instance = terminalInstances.get(terminalId)
+  const queued = pendingTerminalOutput.get(terminalId)
+  if (!instance || !queued?.length) return
+
+  for (const chunk of queued) {
+    instance.terminal.write(chunk)
+  }
+
+  pendingTerminalOutput.delete(terminalId)
+}
+
+const ensureTerminalInstance = (terminalId: string, mount: HTMLDivElement): void => {
+  terminalMounts.set(terminalId, mount)
+
+  if (!terminalInstances.has(terminalId)) {
+    const terminal = new XTerm({
+      allowProposedApi: false,
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+      fontSize: 13,
+      lineHeight: 1.3,
+      macOptionIsMeta: true,
+      scrollback: 3000,
+      theme: {
+        background: '#000000',
+        foreground: '#f5f5f5',
+        cursor: '#f5f5f5',
+        cursorAccent: '#000000',
+        selectionBackground: '#505050',
+        black: '#1f1f1f',
+        red: '#ff7b72',
+        green: '#7ee787',
+        yellow: '#f2cc60',
+        blue: '#79c0ff',
+        magenta: '#d2a8ff',
+        cyan: '#a5f3fc',
+        white: '#c9d1d9',
+        brightBlack: '#6e7681',
+        brightRed: '#ffa198',
+        brightGreen: '#56d364',
+        brightYellow: '#e3b341',
+        brightBlue: '#79c0ff',
+        brightMagenta: '#bc8cff',
+        brightCyan: '#39c5cf',
+        brightWhite: '#f0f6fc'
+      }
+    })
+    const fitAddon = new FitAddon()
+
+    terminal.loadAddon(fitAddon)
+    terminal.open(mount)
+    terminal.onData((data) => {
+      void window.api.writeTerminal({ terminalId, data })
+    })
+    terminal.onResize(({ cols, rows }) => {
+      void window.api.resizeTerminal({ terminalId, cols, rows })
+    })
+
+    terminalInstances.set(terminalId, { terminal, fitAddon })
+    flushPendingTerminalOutput(terminalId)
+  }
+
+  if (state.activeTerminalId === terminalId && state.terminalDockOpen) {
+    scheduleTerminalFit()
+  }
+}
+
+const disposeTerminalInstance = (terminalId: string): void => {
+  terminalMounts.delete(terminalId)
+  pendingTerminalOutput.delete(terminalId)
+  const instance = terminalInstances.get(terminalId)
+  if (!instance) return
+  instance.terminal.dispose()
+  terminalInstances.delete(terminalId)
+}
+
 export const setAppChangeListener = (listener: () => void): void => {
   notifyChange = listener
+}
+
+export const setTerminalCleanup = (
+  subscribe: (listener: (event: TerminalEvent) => void) => () => void
+): void => {
+  unsubscribeTerminal?.()
+  unsubscribeTerminal = subscribe((event) => {
+    if (event.type === 'output') {
+      const instance = terminalInstances.get(event.terminalId)
+      if (!instance) {
+        pendingTerminalOutput.set(event.terminalId, [
+          ...(pendingTerminalOutput.get(event.terminalId) ?? []),
+          event.data
+        ])
+        return
+      }
+
+      instance.terminal.write(event.data)
+      return
+    }
+
+    const instance = terminalInstances.get(event.terminalId)
+    if (instance) {
+      const codeLabel = event.exitCode === null ? 'unknown' : String(event.exitCode)
+      instance.terminal.write(`\r\n[process exited ${codeLabel}]\r\n`)
+    }
+
+    updateState((current) => ({
+      ...current,
+      terminalSessions: current.terminalSessions.map((terminal) =>
+        terminal.id === event.terminalId
+          ? {
+              ...terminal,
+              status: 'exited',
+              exitCode: event.exitCode
+            }
+          : terminal
+      )
+    }))
+  })
 }
 
 export const setStreamCleanup = (
@@ -539,6 +726,19 @@ export const setStreamCleanup = (
   })
 }
 
+const syncTerminalSessions = async (): Promise<void> => {
+  const terminals = await window.api.listTerminals()
+  updateState((current) => ({
+    ...current,
+    terminalSessions: terminals,
+    activeTerminalId:
+      current.activeTerminalId &&
+      terminals.some((terminal) => terminal.id === current.activeTerminalId)
+        ? current.activeTerminalId
+        : (terminals[0]?.id ?? '')
+  }))
+}
+
 const triggerChange = (): void => {
   notifyChange?.()
 }
@@ -582,6 +782,7 @@ const updateState = (updater: (current: AppState) => AppState): void => {
   persistState()
   triggerChange()
   queueMicrotask(syncComposerHeight)
+  queueMicrotask(scheduleTerminalFit)
 }
 
 const syncAuthState = async (): Promise<void> => {
@@ -722,6 +923,96 @@ const toggleSidebar = (): void => {
     sidebarCollapsed: !state.sidebarCollapsed
   }
   triggerChange()
+}
+
+const setActiveTerminal = (terminalId: string): void => {
+  updateState((current) => ({
+    ...current,
+    activeTerminalId: terminalId
+  }))
+  focusActiveTerminal()
+}
+
+const closeTerminal = async (terminalId: string): Promise<void> => {
+  await window.api.closeTerminal({ terminalId })
+  disposeTerminalInstance(terminalId)
+
+  updateState((current) => {
+    const terminalSessions = current.terminalSessions.filter(
+      (terminal) => terminal.id !== terminalId
+    )
+    const activeTerminalId =
+      current.activeTerminalId === terminalId
+        ? (terminalSessions[0]?.id ?? '')
+        : current.activeTerminalId
+
+    return {
+      ...current,
+      terminalSessions,
+      activeTerminalId,
+      terminalDockOpen: terminalSessions.length > 0 ? current.terminalDockOpen : false
+    }
+  })
+
+  if (!state.activeTerminalId) {
+    focusComposer()
+  } else {
+    focusActiveTerminal()
+  }
+}
+
+const createTerminal = async (): Promise<void> => {
+  const activeWorkspace = getActiveWorkspace()
+  const result = await window.api.createTerminal({
+    cwd: activeWorkspace.path !== DEFAULT_WORKSPACE_PATH ? activeWorkspace.path : undefined,
+    title:
+      activeWorkspace.path !== DEFAULT_WORKSPACE_PATH ? `${activeWorkspace.name} shell` : undefined
+  })
+
+  if (!result.ok) {
+    console.error('Failed to create terminal', result.error)
+    return
+  }
+
+  updateState((current) => ({
+    ...current,
+    terminalDockOpen: true,
+    terminalSessions: [...current.terminalSessions, result.terminal],
+    activeTerminalId: result.terminal.id
+  }))
+
+  focusActiveTerminal()
+}
+
+const openTerminalDock = async (): Promise<void> => {
+  if (state.terminalDockOpen && state.terminalSessions.length > 0) {
+    focusActiveTerminal()
+    return
+  }
+
+  if (state.terminalSessions.length === 0) {
+    await createTerminal()
+    return
+  }
+
+  updateState((current) => ({
+    ...current,
+    terminalDockOpen: true
+  }))
+  focusActiveTerminal()
+}
+
+const toggleTerminalDock = async (): Promise<void> => {
+  if (state.terminalDockOpen) {
+    updateState((current) => ({
+      ...current,
+      terminalDockOpen: false
+    }))
+    focusComposer()
+    return
+  }
+
+  await openTerminalDock()
 }
 
 const openDeleteChatDialog = (chatId: string): void => {
@@ -952,6 +1243,12 @@ const onGlobalKeyDown = (event: KeyboardEvent): void => {
     return
   }
 
+  if (modifier && event.key.toLowerCase() === 'j' && state.loggedIn) {
+    event.preventDefault()
+    void toggleTerminalDock()
+    return
+  }
+
   if (modifier && event.key.toLowerCase() === 'n' && state.loggedIn) {
     event.preventDefault()
     createNewChat()
@@ -1168,7 +1465,9 @@ const renderToolInvocation = (tool: ToolInvocation): TemplateResult => {
 
   return html`
     <details class="overflow-hidden" ?open=${false}>
-      <summary class="flex cursor-pointer list-none items-center gap-1.5 py-1 select-none marker:hidden text-[#8f8f8f]">
+      <summary
+        class="flex cursor-pointer list-none items-center gap-1.5 py-1 select-none marker:hidden text-[#8f8f8f]"
+      >
         <span class="text-[13px] font-medium text-[#f5f5f5]">${tool.name}</span>
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -1185,15 +1484,25 @@ const renderToolInvocation = (tool: ToolInvocation): TemplateResult => {
           <path d="m6 9 6 6 6-6" />
         </svg>
         ${statusLabel
-          ? html`<span class=${['text-[12px] font-medium', statusTone].join(' ')}>${statusLabel}</span>`
+          ? html`<span class=${['text-[12px] font-medium', statusTone].join(' ')}
+              >${statusLabel}</span
+            >`
           : ''}
       </summary>
       <div class="pt-2">
         ${tool.argsText
-          ? html`<pre class="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-[#2d2d2d] px-3 py-2 text-xs leading-5 text-[#bdbdbd]">${tool.argsText}</pre>`
+          ? html`<pre
+              class="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-[#2d2d2d] px-3 py-2 text-xs leading-5 text-[#bdbdbd]"
+            >
+${tool.argsText}</pre
+            >`
           : ''}
         ${tool.output
-          ? html`<pre class="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-[#2a2a2a] px-3 py-2 text-xs leading-5 text-[#d8d8d8]">${tool.output}</pre>`
+          ? html`<pre
+              class="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-[#2a2a2a] px-3 py-2 text-xs leading-5 text-[#d8d8d8]"
+            >
+${tool.output}</pre
+            >`
           : tool.status === 'running'
             ? html`<div class="mt-3 text-xs text-[#8f8f8f]">Waiting for output…</div>`
             : ''}
@@ -1215,7 +1524,9 @@ const renderMessage = (message: Message): TemplateResult => {
               ${hasThinking
                 ? html`
                     <details class="overflow-hidden" ?open=${message.streaming && !message.content}>
-                      <summary class="flex cursor-pointer list-none items-center gap-1.5 py-1 select-none marker:hidden text-[#8f8f8f]">
+                      <summary
+                        class="flex cursor-pointer list-none items-center gap-1.5 py-1 select-none marker:hidden text-[#8f8f8f]"
+                      >
                         <span class="text-[13px] font-medium">Thinking</span>
                         <svg
                           xmlns="http://www.w3.org/2000/svg"
@@ -1238,13 +1549,14 @@ const renderMessage = (message: Message): TemplateResult => {
                     </details>
                   `
                 : ''}
-
-              ${tools.length > 0 ? html`<div class="space-y-1">${tools.map((tool) => renderToolInvocation(tool))}</div>` : ''}
-
+              ${tools.length > 0
+                ? html`<div class="space-y-1">
+                    ${tools.map((tool) => renderToolInvocation(tool))}
+                  </div>`
+                : ''}
               ${message.content
                 ? html`<markdown-block .content=${message.content}></markdown-block>`
                 : ''}
-
               ${message.streaming
                 ? html`
                     <div class="mt-2 flex items-center gap-2 text-xs text-[#8f8f8f]">
@@ -1292,6 +1604,97 @@ const renderOnboarding = (): TemplateResult => {
   `
 }
 
+const renderTerminalDock = (): TemplateResult => {
+  const activeTerminalId = state.activeTerminalId
+
+  return html`
+    <div
+      class=${[
+        'terminal-dock w-full shrink-0 self-stretch flex-col overflow-hidden border-t border-[#353535] bg-[#171717] transition-all',
+        state.terminalDockOpen ? 'flex h-[340px] opacity-100' : 'hidden h-0 opacity-0'
+      ].join(' ')}
+    >
+      <div
+        class="flex items-center justify-between gap-3 border-b border-[#2a2a2a] bg-[#171717] px-3 py-2"
+      >
+        <div class="flex min-w-0 items-center gap-2 overflow-x-auto">
+          ${repeat(
+            state.terminalSessions,
+            (terminal) => terminal.id,
+            (terminal) => {
+              const isActive = terminal.id === activeTerminalId
+
+              return html`
+                <div
+                  class=${[
+                    'flex min-w-0 items-center gap-2 rounded-lg px-3 py-1.5 text-sm transition-colors',
+                    isActive
+                      ? 'bg-[#3a3a3a] text-[#f5f5f5]'
+                      : 'bg-transparent text-[#b3b3b3] hover:bg-[#303030]'
+                  ].join(' ')}
+                >
+                  <button
+                    type="button"
+                    class="min-w-0 truncate"
+                    @click=${() => setActiveTerminal(terminal.id)}
+                  >
+                    ${terminal.title} ${terminal.status === 'exited' ? ' (done)' : ''}
+                  </button>
+                  <button
+                    type="button"
+                    class="text-[#8f8f8f] transition-colors hover:text-[#f28b82]"
+                    title="Close terminal"
+                    @click=${() => void closeTerminal(terminal.id)}
+                  >
+                    ${icon(Trash2, 'xs')}
+                  </button>
+                </div>
+              `
+            }
+          )}
+          <button
+            type="button"
+            class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[#b3b3b3] transition-colors hover:bg-[#303030] hover:text-[#f5f5f5]"
+            title="New Terminal"
+            @click=${() => void createTerminal()}
+          >
+            <span class="text-lg leading-none">+</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="min-h-0 flex-1 bg-[#171717]">
+        ${state.terminalSessions.length === 0
+          ? html`
+              <div class="flex h-full items-center justify-center text-sm text-[#8f8f8f]">
+                Open a terminal with Cmd/Ctrl + J
+              </div>
+            `
+          : repeat(
+              state.terminalSessions,
+              (terminal) => terminal.id,
+              (terminal) => {
+                const isActive = terminal.id === activeTerminalId
+                return html`
+                <div
+                  class=${[
+                    'h-full w-full overflow-hidden px-[10px] pb-[10px] pt-[8px]',
+                    isActive && state.terminalDockOpen ? 'block' : 'hidden'
+                  ].join(' ')}
+                  ${ref((element?: Element | null) => {
+                    if (element instanceof HTMLDivElement) {
+                        ensureTerminalInstance(terminal.id, element)
+                      }
+                    })}
+                  ></div>
+                `
+              }
+            )}
+      </div>
+    </div>
+  `
+}
+
 export const App = (): TemplateResult => {
   if (!state.authChecked) {
     return html`
@@ -1325,11 +1728,21 @@ export const App = (): TemplateResult => {
         ${icon(state.sidebarCollapsed ? PanelLeftOpen : PanelLeftClose, 'sm')}
       </button>
 
+      <button
+        type="button"
+        class="absolute right-3 top-3 z-10 flex h-9 w-9 items-center justify-center rounded-lg text-[#f5f5f5] transition-all hover:bg-[#3f3f3f]"
+        aria-label="Toggle terminal"
+        title="Toggle terminal"
+        @click=${() => void toggleTerminalDock()}
+      >
+        ${icon(TerminalSquare, 'sm')}
+      </button>
+
       ${renderSidebar(activeWorkspace, activeChat?.id ?? '')}
 
-      <main class="flex min-w-0 flex-1 bg-[#2f2f2f] px-6 py-6">
-        <div class="flex h-full w-full flex-col">
-          <section class="flex min-h-0 flex-1 flex-col">
+      <main class="flex min-w-0 flex-1 bg-[#2f2f2f] pb-0 pt-6">
+        <div class="flex h-full w-full min-h-0 flex-col overflow-hidden">
+          <section class="flex min-h-0 flex-1 flex-col px-6">
             <div class="flex min-h-0 flex-1 justify-center overflow-hidden">
               <div
                 class="w-full max-w-[760px] overflow-y-auto px-1"
@@ -1339,9 +1752,11 @@ export const App = (): TemplateResult => {
                 })}
               >
                 <div class="space-y-[18px] pt-16">
-                  ${activeChat
-                    ? activeChat.messages.map((message) => renderMessage(message))
-                    : renderNoWorkspaceState()}
+                  ${
+                    activeChat
+                      ? activeChat.messages.map((message) => renderMessage(message))
+                      : renderNoWorkspaceState()
+                  }
                 </div>
               </div>
             </div>
@@ -1371,7 +1786,10 @@ export const App = (): TemplateResult => {
                       variant: 'ghost',
                       value: state.selectedModelId,
                       placeholder: 'Model',
-                      options: state.models.map((model) => ({ value: model.id, label: model.name })),
+                      options: state.models.map((model) => ({
+                        value: model.id,
+                        label: model.name
+                      })),
                       onChange: (value) => {
                         setSelectedModelId(value)
                       },
@@ -1384,7 +1802,10 @@ export const App = (): TemplateResult => {
                       variant: 'ghost',
                       value: state.selectedThinkingLevel,
                       placeholder: 'Thinking',
-                      options: THINKING_LEVELS.map((level) => ({ value: level.id, label: level.label })),
+                      options: THINKING_LEVELS.map((level) => ({
+                        value: level.id,
+                        label: level.label
+                      })),
                       onChange: (value) => {
                         setSelectedThinkingLevel(value as ThinkingLevel)
                       },
@@ -1397,40 +1818,48 @@ export const App = (): TemplateResult => {
                   <button
                     type="button"
                     class="shrink-0 flex h-11 w-11 items-center justify-center bg-transparent text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    title=${isSending
-                      ? 'Assistant responding. This becomes a stop control.'
-                      : 'Send message'}
+                    title=${
+                      isSending
+                        ? 'Assistant responding. This becomes a stop control.'
+                        : 'Send message'
+                    }
                     ?disabled=${(!state.composer.trim() || !activeChat) && !isSending}
                     @click=${() => void sendMessage()}
                   >
-                  ${isSending
-                    ? html`
-                        <svg
-                          xmlns="http://www.w3.org/2000/svg"
-                          width="20"
-                          height="20"
-                          viewBox="0 0 24 24"
-                          fill="currentColor"
-                        >
-                          <rect x="6" y="6" width="12" height="12" rx="1" />
-                        </svg>
-                      `
-                    : html`
-                        <svg
-                          xmlns="http://www.w3.org/2000/svg"
-                          width="32"
-                          height="32"
-                          viewBox="0 0 24 24"
-                          fill="currentColor"
-                          aria-hidden="true"
-                        >
-                          <path d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12.02 7l-.163.01l-.086.016l-.142.045l-.113.054l-.07.043l-.095.071l-.058.054l-4 4l-.083.094a1 1 0 0 0 1.497 1.32L11 10.414V16l.007.117A1 1 0 0 0 13 16v-5.585l2.293 2.292l.094.083a1 1 0 0 0 1.32-1.497l-4-4l-.082-.073l-.089-.064l-.113-.062l-.081-.034l-.113-.034l-.112-.02z" />
-                        </svg>
-                      `}
+                  ${
+                    isSending
+                      ? html`
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="20"
+                            height="20"
+                            viewBox="0 0 24 24"
+                            fill="currentColor"
+                          >
+                            <rect x="6" y="6" width="12" height="12" rx="1" />
+                          </svg>
+                        `
+                      : html`
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="32"
+                            height="32"
+                            viewBox="0 0 24 24"
+                            fill="currentColor"
+                            aria-hidden="true"
+                          >
+                            <path
+                              d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12.02 7l-.163.01l-.086.016l-.142.045l-.113.054l-.07.043l-.095.071l-.058.054l-4 4l-.083.094a1 1 0 0 0 1.497 1.32L11 10.414V16l.007.117A1 1 0 0 0 13 16v-5.585l2.293 2.292l.094.083a1 1 0 0 0 1.32-1.497l-4-4l-.082-.073l-.089-.064l-.113-.062l-.081-.034l-.113-.034l-.112-.02z"
+                            />
+                          </svg>
+                        `
+                  }
                 </button>
               </div>
             </div>
           </section>
+
+          ${renderTerminalDock()}
         </div>
       </main>
 
@@ -1446,7 +1875,9 @@ export const App = (): TemplateResult => {
                 description: 'This will permanently remove the chat from the sidebar.'
               })}
 
-              <div class="mt-4 flex items-center gap-2 rounded-md bg-red-500/10 p-3 text-sm text-[#f5c2c0]">
+              <div
+                class="mt-4 flex items-center gap-2 rounded-md bg-red-500/10 p-3 text-sm text-[#f5c2c0]"
+              >
                 ${icon(AlertTriangle, 'sm', 'text-[#f28b82]')}
                 <span>This action cannot be undone.</span>
               </div>
@@ -1476,4 +1907,6 @@ export const App = (): TemplateResult => {
 }
 
 window.addEventListener('keydown', onGlobalKeyDown)
+window.addEventListener('resize', scheduleTerminalFit)
+void syncTerminalSessions()
 void syncAuthState()

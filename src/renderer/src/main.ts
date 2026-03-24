@@ -1,8 +1,9 @@
 import './assets/main.css'
 import '@mariozechner/mini-lit/dist/MarkdownBlock.js'
+import '@xterm/xterm/css/xterm.css'
 
 import { render } from 'lit'
-import { App, setAppChangeListener, setStreamCleanup } from './App'
+import { App, setAppChangeListener, setStreamCleanup, setTerminalCleanup } from './App'
 
 document.documentElement.classList.add('dark')
 
@@ -18,4 +19,5 @@ const mount = (): void => {
 
 setAppChangeListener(mount)
 setStreamCleanup(window.api.onAgentStreamEvent)
+setTerminalCleanup(window.api.onTerminalEvent)
 mount()
