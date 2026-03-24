@@ -125,16 +125,21 @@ interface PersistedState {
   selectedThinkingLevel: ThinkingLevel
 }
 
+interface ChatRunState {
+  status: 'running' | 'completed' | 'error'
+  requestId: string | null
+  assistantMessageId: string | null
+  hasUnreadCompletion: boolean
+}
+
 interface AppState extends PersistedState {
   composer: string
-  sendingChatId: string | null
+  chatRunStateByChatId: Record<string, ChatRunState>
   authChecked: boolean
   loggedIn: boolean
   authBusy: boolean
   authError: string | null
   models: ModelOption[]
-  activeRequestId: string | null
-  activeAssistantMessageId: string | null
   sidebarCollapsed: boolean
   expandedWorkspaces: Set<string>
   deleteChatId: string | null
@@ -253,14 +258,12 @@ const loadState = (): AppState => {
         selectedModelId: parsed.selectedModelId ?? 'gpt-5.4',
         selectedThinkingLevel: parsed.selectedThinkingLevel ?? 'medium',
         composer: '',
-        sendingChatId: null,
+        chatRunStateByChatId: {},
         authChecked: false,
         loggedIn: false,
         authBusy: false,
         authError: null,
         models: [],
-        activeRequestId: null,
-        activeAssistantMessageId: null,
         sidebarCollapsed: true,
         expandedWorkspaces: new Set<string>(),
         deleteChatId: null
@@ -278,14 +281,12 @@ const loadState = (): AppState => {
     selectedModelId: 'gpt-5.4',
     selectedThinkingLevel: 'medium',
     composer: '',
-    sendingChatId: null,
+    chatRunStateByChatId: {},
     authChecked: false,
     loggedIn: false,
     authBusy: false,
     authError: null,
     models: [],
-    activeRequestId: null,
-    activeAssistantMessageId: null,
     sidebarCollapsed: true,
     expandedWorkspaces: new Set<string>(),
     deleteChatId: null
@@ -297,6 +298,7 @@ let notifyChange: (() => void) | undefined
 let folderPickerInFlight = false
 let unsubscribeStream: (() => void) | undefined
 let composerTextarea: HTMLTextAreaElement | null = null
+let chatScrollContainer: HTMLDivElement | null = null
 
 const syncComposerHeight = (): void => {
   if (!composerTextarea) return
@@ -309,11 +311,51 @@ const syncComposerHeight = (): void => {
   composerTextarea.style.overflowY = composerTextarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
 }
 
+const focusComposer = (): void => {
+  queueMicrotask(() => {
+    composerTextarea?.focus()
+  })
+}
+
+const scrollActiveChatToBottom = (): void => {
+  queueMicrotask(() => {
+    if (!chatScrollContainer) return
+    chatScrollContainer.scrollTop = chatScrollContainer.scrollHeight
+  })
+}
+
+const getChatRunState = (current: AppState, chatId: string): ChatRunState | undefined => {
+  return current.chatRunStateByChatId[chatId]
+}
+
+const isChatRunning = (chatId: string, current: AppState = state): boolean => {
+  return getChatRunState(current, chatId)?.status === 'running'
+}
+
+const clearChatCompletionState = (current: AppState, chatId: string): AppState => {
+  const runState = getChatRunState(current, chatId)
+  if (!runState?.hasUnreadCompletion) return current
+
+  return {
+    ...current,
+    chatRunStateByChatId: {
+      ...current.chatRunStateByChatId,
+      [chatId]: {
+        ...runState,
+        hasUnreadCompletion: false
+      }
+    }
+  }
+}
+
 const updateAssistantMessage = (
   current: AppState,
   chatId: string,
   updater: (message: Message) => Message
 ): AppState => {
+  const assistantMessageId = getChatRunState(current, chatId)?.assistantMessageId
+  if (!assistantMessageId) return current
+
   return {
     ...current,
     chats: sortChats(
@@ -322,9 +364,8 @@ const updateAssistantMessage = (
         return {
           ...chat,
           messages: chat.messages.map((message) =>
-            message.id === current.activeAssistantMessageId ? updater(message) : message
-          ),
-          updatedAt: now()
+            message.id === assistantMessageId ? updater(message) : message
+          )
         }
       })
     )
@@ -354,12 +395,26 @@ export const setStreamCleanup = (
   unsubscribeStream?.()
   unsubscribeStream = subscribe((event) => {
     updateState((current) => {
-      if (event.requestId !== current.activeRequestId || event.chatId !== current.sendingChatId) {
+      const runState = getChatRunState(current, event.chatId)
+      if (!runState) {
+        return current
+      }
+
+      if (runState.requestId && event.requestId !== runState.requestId) {
         return current
       }
 
       if (event.type === 'start') {
-        return current
+        return {
+          ...current,
+          chatRunStateByChatId: {
+            ...current.chatRunStateByChatId,
+            [event.chatId]: {
+              ...runState,
+              status: 'running'
+            }
+          }
+        }
       }
 
       if (event.type === 'text_delta') {
@@ -421,27 +476,61 @@ export const setStreamCleanup = (
       }
 
       if (event.type === 'end') {
+        const nextState = updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          streaming: false
+        }))
+
         return {
-          ...updateAssistantMessage(current, event.chatId, (message) => ({
-            ...message,
-            streaming: false
-          })),
-          sendingChatId: null,
-          activeRequestId: null,
-          activeAssistantMessageId: null
+          ...nextState,
+          chats: sortChats(
+            nextState.chats.map((chat) =>
+              chat.id === event.chatId
+                ? {
+                    ...chat,
+                    updatedAt: now()
+                  }
+                : chat
+            )
+          ),
+          chatRunStateByChatId: {
+            ...nextState.chatRunStateByChatId,
+            [event.chatId]: {
+              ...runState,
+              status: 'completed',
+              hasUnreadCompletion: current.activeChatId !== event.chatId
+            }
+          }
         }
       }
 
       if (event.type === 'error') {
+        const nextState = updateAssistantMessage(current, event.chatId, (message) => ({
+          ...message,
+          content: message.content || `Agent error: ${event.error}`,
+          streaming: false
+        }))
+
         return {
-          ...updateAssistantMessage(current, event.chatId, (message) => ({
-            ...message,
-            content: message.content || `Agent error: ${event.error}`,
-            streaming: false
-          })),
-          sendingChatId: null,
-          activeRequestId: null,
-          activeAssistantMessageId: null
+          ...nextState,
+          chats: sortChats(
+            nextState.chats.map((chat) =>
+              chat.id === event.chatId
+                ? {
+                    ...chat,
+                    updatedAt: now()
+                  }
+                : chat
+            )
+          ),
+          chatRunStateByChatId: {
+            ...nextState.chatRunStateByChatId,
+            [event.chatId]: {
+              ...runState,
+              status: 'error',
+              hasUnreadCompletion: false
+            }
+          }
         }
       }
 
@@ -573,7 +662,7 @@ const getActiveChat = (): Chat | undefined => {
 }
 
 const createChatForWorkspace = (workspacePath: string): void => {
-  if (workspacePath === DEFAULT_WORKSPACE_PATH || state.sendingChatId || !state.loggedIn) return
+  if (workspacePath === DEFAULT_WORKSPACE_PATH || !state.loggedIn) return
 
   const workspace = getWorkspaceByPath(state.workspaces, workspacePath)
   if (workspace.path === DEFAULT_WORKSPACE_PATH) return
@@ -586,6 +675,8 @@ const createChatForWorkspace = (workspacePath: string): void => {
     chats: sortChats([chat, ...current.chats]),
     composer: ''
   }))
+  focusComposer()
+  scrollActiveChatToBottom()
 }
 
 const createNewChat = (): void => {
@@ -597,12 +688,17 @@ const selectChat = (chatId: string): void => {
     const chat = current.chats.find((entry) => entry.id === chatId)
     if (!chat) return current
 
-    return {
-      ...current,
-      activeWorkspacePath: chat.workspacePath,
-      activeChatId: chatId
-    }
+    return clearChatCompletionState(
+      {
+        ...current,
+        activeWorkspacePath: chat.workspacePath,
+        activeChatId: chatId
+      },
+      chatId
+    )
   })
+  focusComposer()
+  scrollActiveChatToBottom()
 }
 
 const toggleWorkspaceExpanded = (workspacePath: string): void => {
@@ -644,7 +740,7 @@ const closeDeleteChatDialog = (): void => {
 
 const confirmDeleteChat = (): void => {
   const targetChatId = state.deleteChatId
-  if (!targetChatId || state.sendingChatId === targetChatId) return
+  if (!targetChatId || isChatRunning(targetChatId)) return
 
   updateState((current) => {
     const chatToDelete = current.chats.find((chat) => chat.id === targetChatId)
@@ -658,10 +754,13 @@ const confirmDeleteChat = (): void => {
     const chats = sortChats(current.chats.filter((chat) => chat.id !== targetChatId))
     const workspaceChats = getChatsForWorkspace(chatToDelete.workspacePath, chats)
     const fallbackChat = workspaceChats[0]
+    const nextChatRunStateByChatId = { ...current.chatRunStateByChatId }
+    delete nextChatRunStateByChatId[targetChatId]
 
     return {
       ...current,
       chats,
+      chatRunStateByChatId: nextChatRunStateByChatId,
       activeWorkspacePath: chatToDelete.workspacePath,
       activeChatId:
         current.activeChatId === targetChatId ? (fallbackChat?.id ?? '') : current.activeChatId,
@@ -671,7 +770,7 @@ const confirmDeleteChat = (): void => {
 }
 
 const openFolder = async (): Promise<void> => {
-  if (folderPickerInFlight || state.sendingChatId || !state.loggedIn) return
+  if (folderPickerInFlight || !state.loggedIn) return
   folderPickerInFlight = true
 
   try {
@@ -693,15 +792,20 @@ const openFolder = async (): Promise<void> => {
       const activeChat = existingChats[0] ?? createChat(workspace)
       const chats = existingChats[0] ? current.chats : sortChats([activeChat, ...current.chats])
 
-      return {
-        ...current,
-        workspaces,
-        chats,
-        activeWorkspacePath: folder.path,
-        activeChatId: activeChat.id,
-        composer: ''
-      }
+      return clearChatCompletionState(
+        {
+          ...current,
+          workspaces,
+          chats,
+          activeWorkspacePath: folder.path,
+          activeChatId: activeChat.id,
+          composer: ''
+        },
+        activeChat.id
+      )
     })
+    focusComposer()
+    scrollActiveChatToBottom()
   } finally {
     folderPickerInFlight = false
   }
@@ -716,7 +820,7 @@ const sendMessage = async (): Promise<void> => {
     !content ||
     !activeChat ||
     workspace.path === DEFAULT_WORKSPACE_PATH ||
-    state.sendingChatId !== null ||
+    isChatRunning(activeChat.id) ||
     !state.loggedIn
   ) {
     return
@@ -754,9 +858,15 @@ const sendMessage = async (): Promise<void> => {
       })
     ),
     composer: '',
-    sendingChatId: activeChat.id,
-    activeAssistantMessageId: assistantMessageId,
-    activeRequestId: null
+    chatRunStateByChatId: {
+      ...current.chatRunStateByChatId,
+      [activeChat.id]: {
+        status: 'running',
+        requestId: null,
+        assistantMessageId,
+        hasUnreadCompletion: false
+      }
+    }
   }))
 
   const result = await window.api.sendChatMessage({
@@ -770,9 +880,6 @@ const sendMessage = async (): Promise<void> => {
   if (!result.ok) {
     updateState((current) => ({
       ...current,
-      sendingChatId: null,
-      activeRequestId: null,
-      activeAssistantMessageId: null,
       chats: sortChats(
         current.chats.map((chat) => {
           if (chat.id !== activeChat.id) return chat
@@ -786,15 +893,37 @@ const sendMessage = async (): Promise<void> => {
             updatedAt: now()
           }
         })
-      )
+      ),
+      chatRunStateByChatId: {
+        ...current.chatRunStateByChatId,
+        [activeChat.id]: {
+          status: 'error',
+          requestId: null,
+          assistantMessageId,
+          hasUnreadCompletion: false
+        }
+      }
     }))
     return
   }
 
-  updateState((current) => ({
-    ...current,
-    activeRequestId: result.requestId
-  }))
+  updateState((current) => {
+    const runState = getChatRunState(current, activeChat.id)
+    if (!runState || runState.assistantMessageId !== assistantMessageId) {
+      return current
+    }
+
+    return {
+      ...current,
+      chatRunStateByChatId: {
+        ...current.chatRunStateByChatId,
+        [activeChat.id]: {
+          ...runState,
+          requestId: result.requestId
+        }
+      }
+    }
+  })
 }
 
 const onGlobalKeyDown = (event: KeyboardEvent): void => {
@@ -817,13 +946,13 @@ const onGlobalKeyDown = (event: KeyboardEvent): void => {
     return
   }
 
-  if (modifier && event.key.toLowerCase() === 'b' && state.loggedIn && !isTextInput) {
+  if (modifier && event.key.toLowerCase() === 'b' && state.loggedIn) {
     event.preventDefault()
     toggleSidebar()
     return
   }
 
-  if (modifier && event.key.toLowerCase() === 'n' && state.loggedIn && !isTextInput) {
+  if (modifier && event.key.toLowerCase() === 'n' && state.loggedIn) {
     event.preventDefault()
     createNewChat()
     return
@@ -864,6 +993,22 @@ const renderTablerPlus = (className = 'h-4 w-4'): TemplateResult => html`
   </svg>
 `
 
+const renderChatStatusIndicator = (chatId: string, isActive: boolean): TemplateResult => {
+  const runState = getChatRunState(state, chatId)
+  const isBackgroundRunning = runState?.status === 'running' && !isActive
+  const showCompleted = Boolean(runState?.hasUnreadCompletion && !isActive)
+
+  return html`
+    <span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+      ${isBackgroundRunning
+        ? icon(LoaderCircle, 'xs', 'h-3.5 w-3.5 animate-spin text-[#8ab4ff]')
+        : showCompleted
+          ? html`<span class="h-1.5 w-1.5 rounded-full bg-[#4da3ff]"></span>`
+          : ''}
+    </span>
+  `
+}
+
 const renderChatList = (workspace: Workspace, activeChatId: string): TemplateResult => {
   const chats = getChatsForWorkspace(workspace.path, state.chats)
 
@@ -871,7 +1016,7 @@ const renderChatList = (workspace: Workspace, activeChatId: string): TemplateRes
     <div class="space-y-1 pl-7">
       ${chats.map((chat) => {
         const isActive = chat.id === activeChatId
-        const canDelete = state.sendingChatId !== chat.id
+        const canDelete = !isChatRunning(chat.id)
 
         return html`
           <div class="group relative">
@@ -883,8 +1028,11 @@ const renderChatList = (workspace: Workspace, activeChatId: string): TemplateRes
               ].join(' ')}
               @click=${() => selectChat(chat.id)}
             >
-              <span class="min-w-0 truncate text-[13px] font-medium leading-none text-[#f5f5f5]">
-                ${chat.title}
+              <span class="flex min-w-0 items-center gap-2">
+                ${renderChatStatusIndicator(chat.id, isActive)}
+                <span class="min-w-0 truncate text-[13px] font-medium leading-none text-[#f5f5f5]">
+                  ${chat.title}
+                </span>
               </span>
               <span class="flex shrink-0 items-center gap-2">
                 ${canDelete
@@ -926,8 +1074,7 @@ const renderSidebar = (activeWorkspace: Workspace, activeChatId: string): Templa
               <button
                 type="button"
                 class="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[#f5f5f5] transition-colors hover:bg-[#434343]"
-                ?disabled=${activeWorkspace.path === DEFAULT_WORKSPACE_PATH ||
-                state.sendingChatId !== null}
+                ?disabled=${activeWorkspace.path === DEFAULT_WORKSPACE_PATH}
                 @click=${() => createNewChat()}
               >
                 ${icon(SquarePen, 'sm')}
@@ -940,7 +1087,6 @@ const renderSidebar = (activeWorkspace: Workspace, activeChatId: string): Templa
                   type="button"
                   class="flex h-7 w-7 items-center justify-center rounded-lg text-[#f5f5f5] transition-colors hover:bg-[#434343]"
                   title="Add New Project (Cmd/Ctrl + O)"
-                  ?disabled=${state.sendingChatId !== null}
                   @click=${() => void openFolder()}
                 >
                   ${icon(FolderPlus, 'sm')}
@@ -982,7 +1128,6 @@ const renderSidebar = (activeWorkspace: Workspace, activeChatId: string): Templa
                                 type="button"
                                 class="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#8f8f8f] transition-colors hover:bg-[#434343] hover:text-[#f5f5f5]"
                                 title="New chat in ${workspace.name}"
-                                ?disabled=${state.sendingChatId !== null}
                                 @click=${(event: Event) => {
                                   event.stopPropagation()
                                   createChatForWorkspace(workspace.path)
@@ -1166,7 +1311,7 @@ export const App = (): TemplateResult => {
   const activeWorkspace = getActiveWorkspace()
   const activeChat = getActiveChat()
   const hasWorkspace = activeWorkspace.path !== DEFAULT_WORKSPACE_PATH
-  const isSending = state.sendingChatId === activeChat?.id
+  const isSending = activeChat ? isChatRunning(activeChat.id) : false
 
   return html`
     <div class="relative flex h-screen bg-[#2f2f2f] text-[#f5f5f5]">
@@ -1186,7 +1331,13 @@ export const App = (): TemplateResult => {
         <div class="flex h-full w-full flex-col">
           <section class="flex min-h-0 flex-1 flex-col">
             <div class="flex min-h-0 flex-1 justify-center overflow-hidden">
-              <div class="w-full max-w-[760px] overflow-y-auto px-1" ${scrollToBottom()}>
+              <div
+                class="w-full max-w-[760px] overflow-y-auto px-1"
+                ${scrollToBottom()}
+                ${ref((element?: Element | null) => {
+                  chatScrollContainer = element instanceof HTMLDivElement ? element : null
+                })}
+              >
                 <div class="space-y-[18px] pt-16">
                   ${activeChat
                     ? activeChat.messages.map((message) => renderMessage(message))
