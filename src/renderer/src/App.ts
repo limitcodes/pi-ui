@@ -2,6 +2,7 @@ import { html, type TemplateResult } from 'lit'
 import { ref } from 'lit/directives/ref.js'
 import { repeat } from 'lit/directives/repeat.js'
 import { type DirectiveResult } from 'lit/directive.js'
+import * as DiffLib from 'diff'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal as XTerm } from '@xterm/xterm'
 
@@ -26,12 +27,14 @@ import {
 import { Button } from '@mariozechner/mini-lit/dist/Button.js'
 import {
   AlertTriangle,
+  Diff,
   Folder,
   FolderOpen,
   FolderPlus,
   LoaderCircle,
   PanelLeftClose,
   PanelLeftOpen,
+  RefreshCw,
   Settings,
   SquarePen,
   TerminalSquare,
@@ -106,6 +109,21 @@ type TerminalEvent =
   | { type: 'output'; terminalId: string; data: string }
   | { type: 'exit'; terminalId: string; exitCode: number | null }
 
+interface ReviewFile {
+  path: string
+  oldText: string
+  newText: string
+  added: number
+  removed: number
+}
+
+interface ReviewDiffRow {
+  kind: 'context' | 'add' | 'remove' | 'ellipsis'
+  text: string
+  leftLineNumber: number | null
+  rightLineNumber: number | null
+}
+
 interface ToolInvocation {
   id: string
   name: string
@@ -170,10 +188,19 @@ interface AppState extends PersistedState {
   terminalDockOpen: boolean
   terminalSessions: TerminalSessionSummary[]
   activeTerminalId: string
+  reviewSidebarOpen: boolean
+  reviewFiles: ReviewFile[]
+  expandedReviewFiles: Set<string>
+  reviewLoading: boolean
+  reviewError: string | null
+  reviewLastLoadedWorkspacePath: string
 }
 
 const STORAGE_KEY = 'pi-ui.chats.v5'
 const DEFAULT_WORKSPACE_PATH = '__no-folder__'
+const REVIEW_SIDEBAR_WIDTH = 584
+const REVIEW_REFRESH_DEBOUNCE_MS = 180
+const REVIEW_DIFF_CONTEXT_LINES = 3
 
 const now = (): number => Date.now()
 
@@ -299,7 +326,13 @@ const loadState = (): AppState => {
         deleteChatId: null,
         terminalDockOpen: false,
         terminalSessions: [],
-        activeTerminalId: ''
+        activeTerminalId: '',
+        reviewSidebarOpen: false,
+        reviewFiles: [],
+        expandedReviewFiles: new Set<string>(),
+        reviewLoading: false,
+        reviewError: null,
+        reviewLastLoadedWorkspacePath: ''
       }
     }
   } catch (error) {
@@ -326,7 +359,13 @@ const loadState = (): AppState => {
     deleteChatId: null,
     terminalDockOpen: false,
     terminalSessions: [],
-    activeTerminalId: ''
+    activeTerminalId: '',
+    reviewSidebarOpen: false,
+    reviewFiles: [],
+    expandedReviewFiles: new Set<string>(),
+    reviewLoading: false,
+    reviewError: null,
+    reviewLastLoadedWorkspacePath: ''
   }
 }
 
@@ -342,6 +381,8 @@ const terminalInstances = new Map<string, { terminal: XTerm; fitAddon: FitAddon 
 const terminalMounts = new Map<string, HTMLDivElement>()
 const pendingTerminalOutput = new Map<string, string[]>()
 let terminalResizeTick: number | null = null
+let reviewRefreshTick: number | null = null
+let reviewRefreshRequestId = 0
 
 const syncComposerHeight = (): void => {
   if (!composerTextarea) return
@@ -773,6 +814,10 @@ export const setStreamCleanup = (
     if (notification) {
       void window.api.showChatNotification(notification)
     }
+
+    if (event.type === 'end' || event.type === 'error') {
+      scheduleReviewRefresh({ force: true })
+    }
   })
 }
 
@@ -833,6 +878,115 @@ const updateState = (updater: (current: AppState) => AppState): void => {
   triggerChange()
   queueMicrotask(syncComposerHeight)
   queueMicrotask(scheduleTerminalFit)
+}
+
+const getActiveWorkspacePath = (): string => {
+  return state.activeWorkspacePath
+}
+
+const clearReviewSidebar = (): void => {
+  updateState((current) => ({
+    ...current,
+    reviewFiles: [],
+    expandedReviewFiles: new Set<string>(),
+    reviewLoading: false,
+    reviewError: null,
+    reviewLastLoadedWorkspacePath: ''
+  }))
+}
+
+const loadWorkspaceDiff = async (force = false): Promise<void> => {
+  const workspacePath = getActiveWorkspacePath()
+
+  if (workspacePath === DEFAULT_WORKSPACE_PATH) {
+    clearReviewSidebar()
+    return
+  }
+
+  if (!state.reviewSidebarOpen && !force) return
+  if (
+    !force &&
+    state.reviewLastLoadedWorkspacePath === workspacePath &&
+    !state.reviewLoading &&
+    !state.reviewError
+  ) {
+    return
+  }
+
+  const requestId = ++reviewRefreshRequestId
+  updateState((current) => ({
+    ...current,
+    reviewLoading: true,
+    reviewError: null
+  }))
+
+  const result = await window.api.getWorkspaceDiff({ cwd: workspacePath })
+
+  if (requestId !== reviewRefreshRequestId) {
+    return
+  }
+
+  if (!result.ok) {
+    updateState((current) => {
+      if (current.activeWorkspacePath !== workspacePath) {
+        return current
+      }
+
+      return {
+        ...current,
+        reviewFiles: [],
+        expandedReviewFiles: new Set<string>(),
+        reviewLoading: false,
+        reviewError: result.error,
+        reviewLastLoadedWorkspacePath: workspacePath
+      }
+    })
+    return
+  }
+
+  updateState((current) => {
+    if (current.activeWorkspacePath !== workspacePath) {
+      return current
+    }
+
+    const nextExpanded = new Set(
+      [...current.expandedReviewFiles].filter((path) =>
+        result.files.some((reviewFile) => reviewFile.path === path)
+      )
+    )
+
+    return {
+      ...current,
+      reviewFiles: result.files,
+      expandedReviewFiles: nextExpanded,
+      reviewLoading: false,
+      reviewError: null,
+      reviewLastLoadedWorkspacePath: workspacePath
+    }
+  })
+}
+
+const scheduleReviewRefresh = ({
+  force = false,
+  immediate = false
+}: {
+  force?: boolean
+  immediate?: boolean
+} = {}): void => {
+  if (reviewRefreshTick) {
+    window.clearTimeout(reviewRefreshTick)
+    reviewRefreshTick = null
+  }
+
+  if (immediate) {
+    void loadWorkspaceDiff(force)
+    return
+  }
+
+  reviewRefreshTick = window.setTimeout(() => {
+    reviewRefreshTick = null
+    void loadWorkspaceDiff(force)
+  }, REVIEW_REFRESH_DEBOUNCE_MS)
 }
 
 const syncAuthState = async (): Promise<void> => {
@@ -932,6 +1086,7 @@ const createChatForWorkspace = (workspacePath: string): void => {
   }))
   focusComposer()
   scrollActiveChatToBottom()
+  scheduleReviewRefresh({ immediate: true, force: true })
 }
 
 const createNewChat = (): void => {
@@ -954,6 +1109,7 @@ const selectChat = (chatId: string): void => {
   })
   focusComposer()
   scrollActiveChatToBottom()
+  scheduleReviewRefresh({ immediate: true, force: true })
 }
 
 const toggleWorkspaceExpanded = (workspacePath: string): void => {
@@ -977,6 +1133,35 @@ const toggleSidebar = (): void => {
     sidebarCollapsed: !state.sidebarCollapsed
   }
   triggerChange()
+}
+
+const toggleReviewSidebar = (): void => {
+  const nextOpen = !state.reviewSidebarOpen
+
+  updateState((current) => ({
+    ...current,
+    reviewSidebarOpen: nextOpen
+  }))
+
+  if (nextOpen) {
+    scheduleReviewRefresh({ immediate: true, force: true })
+  }
+}
+
+const toggleReviewFileExpanded = (path: string): void => {
+  updateState((current) => {
+    const expandedReviewFiles = new Set(current.expandedReviewFiles)
+    if (expandedReviewFiles.has(path)) {
+      expandedReviewFiles.delete(path)
+    } else {
+      expandedReviewFiles.add(path)
+    }
+
+    return {
+      ...current,
+      expandedReviewFiles
+    }
+  })
 }
 
 const setActiveTerminal = (terminalId: string): void => {
@@ -1199,6 +1384,7 @@ const openFolder = async (): Promise<void> => {
     })
     focusComposer()
     scrollActiveChatToBottom()
+    scheduleReviewRefresh({ immediate: true, force: true })
   } finally {
     folderPickerInFlight = false
   }
@@ -1327,7 +1513,7 @@ const onGlobalKeyDown = (event: KeyboardEvent): void => {
     target instanceof HTMLInputElement ||
     target?.isContentEditable === true
 
-  if (modifier && event.key.toLowerCase() === 'a' && target instanceof HTMLTextAreaElement) {
+  if (modifier && event.code === 'KeyA' && target instanceof HTMLTextAreaElement) {
     event.preventDefault()
     target.select()
     return
@@ -1339,7 +1525,13 @@ const onGlobalKeyDown = (event: KeyboardEvent): void => {
     return
   }
 
-  if (modifier && event.key.toLowerCase() === 'b' && state.loggedIn) {
+  if (modifier && event.altKey && event.code === 'KeyB' && state.loggedIn) {
+    event.preventDefault()
+    toggleReviewSidebar()
+    return
+  }
+
+  if (modifier && event.code === 'KeyB' && state.loggedIn) {
     event.preventDefault()
     toggleSidebar()
     return
@@ -1351,19 +1543,19 @@ const onGlobalKeyDown = (event: KeyboardEvent): void => {
     return
   }
 
-  if (modifier && event.key.toLowerCase() === 'j' && state.loggedIn) {
+  if (modifier && event.code === 'KeyJ' && state.loggedIn) {
     event.preventDefault()
     void toggleTerminalDock()
     return
   }
 
-  if (modifier && event.key.toLowerCase() === 'n' && state.loggedIn) {
+  if (modifier && event.code === 'KeyN' && state.loggedIn) {
     event.preventDefault()
     createNewChat()
     return
   }
 
-  if (modifier && event.key.toLowerCase() === 'o' && state.loggedIn && !isTextInput) {
+  if (modifier && event.code === 'KeyO' && state.loggedIn && !isTextInput) {
     event.preventDefault()
     void openFolder()
   }
@@ -1563,6 +1755,295 @@ const renderSidebar = (activeWorkspace: Workspace, activeChatId: string): Templa
             </aside>
           `}
     </div>
+  `
+}
+
+const renderReviewChevron = (className = 'h-3.5 w-3.5'): TemplateResult => html`
+  <svg
+    class=${className}
+    viewBox="0 0 16 16"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-hidden="true"
+  >
+    <path
+      d="M4.5 6.25 8 9.75l3.5-3.5"
+      stroke="currentColor"
+      stroke-width="1.35"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </svg>
+`
+
+const formatReviewLineNumber = (value: number | null): string => {
+  return value === null ? '' : String(value)
+}
+
+const getReviewDiffRows = (reviewFile: ReviewFile): ReviewDiffRow[] => {
+  const rows: ReviewDiffRow[] = []
+  let leftLineNumber = 1
+  let rightLineNumber = 1
+
+  for (const part of DiffLib.diffLines(reviewFile.oldText ?? '', reviewFile.newText ?? '')) {
+    const lines = part.value.split('\n')
+    if (lines[lines.length - 1] === '') {
+      lines.pop()
+    }
+
+    for (const line of lines) {
+      if (part.added) {
+        rows.push({
+          kind: 'add',
+          text: line,
+          leftLineNumber: null,
+          rightLineNumber
+        })
+        rightLineNumber += 1
+        continue
+      }
+
+      if (part.removed) {
+        rows.push({
+          kind: 'remove',
+          text: line,
+          leftLineNumber,
+          rightLineNumber: null
+        })
+        leftLineNumber += 1
+        continue
+      }
+
+      rows.push({
+        kind: 'context',
+        text: line,
+        leftLineNumber,
+        rightLineNumber
+      })
+      leftLineNumber += 1
+      rightLineNumber += 1
+    }
+  }
+
+  const changedIndexes = rows.flatMap((row, index) => (row.kind === 'context' ? [] : [index]))
+  if (changedIndexes.length === 0) {
+    return rows.slice(0, 40)
+  }
+
+  const includedIndexes = new Set<number>()
+
+  for (const changedIndex of changedIndexes) {
+    const start = Math.max(0, changedIndex - REVIEW_DIFF_CONTEXT_LINES)
+    const end = Math.min(rows.length - 1, changedIndex + REVIEW_DIFF_CONTEXT_LINES)
+    for (let index = start; index <= end; index += 1) {
+      includedIndexes.add(index)
+    }
+  }
+
+  const collapsedRows: ReviewDiffRow[] = []
+  let previousIncludedIndex: number | null = null
+
+  for (let index = 0; index < rows.length; index += 1) {
+    if (!includedIndexes.has(index)) {
+      continue
+    }
+
+    if (previousIncludedIndex !== null && index - previousIncludedIndex > 1) {
+      const skippedLines = index - previousIncludedIndex - 1
+      collapsedRows.push({
+        kind: 'ellipsis',
+        text: `${skippedLines} unchanged line${skippedLines === 1 ? '' : 's'}`,
+        leftLineNumber: null,
+        rightLineNumber: null
+      })
+    }
+
+    collapsedRows.push(rows[index])
+    previousIncludedIndex = index
+  }
+
+  return collapsedRows
+}
+
+const renderReviewDiff = (reviewFile: ReviewFile): TemplateResult => {
+  const rows = getReviewDiffRows(reviewFile)
+
+  return html`
+    <div class="overflow-hidden rounded-xl border border-[#3b3b3b] bg-[#232323]">
+      <div class="border-b border-[#343434] bg-[#272727] px-3 py-2">
+        <div class="flex items-center gap-3 text-[11px] text-[#9a9a9a]">
+          <span class="font-mono">${reviewFile.path}</span>
+          <span class="text-[#73d07f]">+${reviewFile.added}</span>
+          <span class="text-[#ef8e8e]">-${reviewFile.removed}</span>
+        </div>
+      </div>
+
+      <div class="max-h-[460px] overflow-auto">
+        ${rows.map((row) => {
+          if (row.kind === 'ellipsis') {
+            return html`
+              <div class="border-y border-[#333333] bg-[#292929] px-4 py-1.5 text-center text-[11px] text-[#858585]">
+                ${row.text}
+              </div>
+            `
+          }
+
+          const rowTone =
+            row.kind === 'add'
+              ? 'bg-[#0f2a18]'
+              : row.kind === 'remove'
+                ? 'bg-[#321a1a]'
+                : 'bg-transparent'
+
+          return html`
+            <div
+              class=${[
+                'grid grid-cols-[56px_56px_minmax(0,1fr)] items-start gap-0 border-b border-[#2f2f2f] text-[12px] leading-5',
+                rowTone
+              ].join(' ')}
+            >
+              <div class="select-none px-3 py-1 text-right font-mono text-[#666666]">
+                ${formatReviewLineNumber(row.leftLineNumber)}
+              </div>
+              <div class="select-none px-3 py-1 text-right font-mono text-[#666666]">
+                ${formatReviewLineNumber(row.rightLineNumber)}
+              </div>
+              <pre class="m-0 overflow-x-auto px-3 py-1 font-mono text-[#e6e6e6]">${row.kind === 'add'
+                ? '+'
+                : row.kind === 'remove'
+                  ? '-'
+                  : ' '}${row.text}</pre>
+            </div>
+          `
+        })}
+      </div>
+    </div>
+  `
+}
+
+const renderReviewSidebar = (activeWorkspace: Workspace): TemplateResult => {
+  if (!state.reviewSidebarOpen) {
+    return html``
+  }
+
+  const hasWorkspace = activeWorkspace.path !== DEFAULT_WORKSPACE_PATH
+  const hasFiles = state.reviewFiles.length > 0
+
+  return html`
+    <aside
+      class="flex h-full shrink-0 flex-col border-l border-[#4a4a4a] bg-[#262626]"
+      style=${`width: ${REVIEW_SIDEBAR_WIDTH}px; min-width: ${REVIEW_SIDEBAR_WIDTH}px;`}
+    >
+      <div class="flex items-start justify-between gap-3 border-b border-[#3b3b3b] px-4 pb-3 pt-4">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 text-[#f5f5f5]">
+            ${icon(Diff, 'sm')}
+            <span class="text-[15px] font-semibold">Review changes</span>
+          </div>
+          <p class="mt-1 text-[12px] leading-5 text-[#9a9a9a]">
+            ${hasWorkspace
+              ? `${state.reviewFiles.length} file${state.reviewFiles.length === 1 ? '' : 's'} in ${activeWorkspace.name}`
+              : 'Open a workspace to review changes'}
+          </p>
+        </div>
+
+        <div class="flex items-center gap-1">
+          <button
+            type="button"
+            class="flex h-8 w-8 items-center justify-center rounded-lg text-[#b8b8b8] transition-colors hover:bg-[#343434] hover:text-[#f5f5f5] disabled:cursor-not-allowed disabled:opacity-40"
+            title="Refresh review"
+            ?disabled=${!hasWorkspace || state.reviewLoading}
+            @click=${() => scheduleReviewRefresh({ immediate: true, force: true })}
+          >
+            ${icon(RefreshCw, 'sm', state.reviewLoading ? 'animate-spin' : '')}
+          </button>
+          <button
+            type="button"
+            class="flex h-8 w-8 items-center justify-center rounded-lg text-[#b8b8b8] transition-colors hover:bg-[#343434] hover:text-[#f5f5f5]"
+            title="Close review sidebar"
+            @click=${toggleReviewSidebar}
+          >
+            ${renderReviewChevron('-rotate-90')}
+          </button>
+        </div>
+      </div>
+
+      <div class="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        ${!hasWorkspace
+          ? html`
+              <div class="rounded-2xl border border-dashed border-[#404040] px-4 py-5 text-sm text-[#9a9a9a]">
+                Open a git workspace to review changes inside the app.
+              </div>
+            `
+          : state.reviewError
+            ? html`
+                <div class="rounded-2xl border border-[#553636] bg-[#321f1f] px-4 py-5 text-sm text-[#f2b8b5]">
+                  ${state.reviewError}
+                </div>
+              `
+            : state.reviewLoading && !hasFiles
+              ? html`
+                  <div class="flex items-center gap-3 rounded-2xl border border-[#3b3b3b] px-4 py-5 text-sm text-[#9a9a9a]">
+                    ${icon(LoaderCircle, 'sm', 'animate-spin')}
+                    <span>Loading workspace diff…</span>
+                  </div>
+                `
+              : !hasFiles
+                ? html`
+                    <div class="rounded-2xl border border-dashed border-[#404040] px-4 py-5 text-sm text-[#9a9a9a]">
+                      No uncommitted file changes in this workspace.
+                    </div>
+                  `
+                : html`
+                    <div class="space-y-2">
+                      ${repeat(
+                        state.reviewFiles,
+                        (reviewFile) => reviewFile.path,
+                        (reviewFile) => {
+                          const isExpanded = state.expandedReviewFiles.has(reviewFile.path)
+
+                          return html`
+                            <section class="overflow-hidden rounded-2xl border border-[#3b3b3b] bg-[#2d2d2d]">
+                              <button
+                                type="button"
+                                class="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors hover:bg-[#343434]"
+                                @click=${() => toggleReviewFileExpanded(reviewFile.path)}
+                              >
+                                <div class="flex min-w-0 items-center gap-3">
+                                  <div class="truncate text-[13px] font-semibold text-[#f5f5f5]">
+                                    ${reviewFile.path}
+                                  </div>
+                                  <div class="flex shrink-0 items-center gap-2 text-[11px] text-[#9a9a9a]">
+                                    <span class="text-[#73d07f]">+${reviewFile.added}</span>
+                                    <span class="text-[#ef8e8e]">-${reviewFile.removed}</span>
+                                  </div>
+                                </div>
+
+                                <span
+                                  class=${[
+                                    'flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#383838] text-[#b8b8b8] transition-transform',
+                                    isExpanded ? 'rotate-180' : ''
+                                  ].join(' ')}
+                                >
+                                  ${renderReviewChevron()}
+                                </span>
+                              </button>
+
+                              ${isExpanded
+                                ? html`
+                                    <div class="border-t border-[#3b3b3b] px-3 py-3">
+                                      ${renderReviewDiff(reviewFile)}
+                                    </div>
+                                  `
+                                : ''}
+                            </section>
+                          `
+                        }
+                      )}
+                    </div>
+                  `}
+      </div>
+    </aside>
   `
 }
 
@@ -1835,6 +2316,9 @@ export const App = (): TemplateResult => {
   const activeChat = getActiveChat()
   const hasWorkspace = activeWorkspace.path !== DEFAULT_WORKSPACE_PATH
   const isSending = activeChat ? isChatRunning(activeChat.id) : false
+  const rightControlsStyle = state.reviewSidebarOpen
+    ? `right: ${REVIEW_SIDEBAR_WIDTH + 12}px;`
+    : 'right: 12px;'
 
   return html`
     <div class="relative flex h-screen bg-[#2f2f2f] text-[#f5f5f5]">
@@ -1848,140 +2332,162 @@ export const App = (): TemplateResult => {
         ${icon(state.sidebarCollapsed ? PanelLeftOpen : PanelLeftClose, 'sm')}
       </button>
 
-      <button
-        type="button"
-        class="absolute right-3 top-3 z-10 flex h-9 w-9 items-center justify-center rounded-lg text-[#f5f5f5] transition-all hover:bg-[#3f3f3f]"
-        aria-label="Toggle terminal"
-        title="Toggle terminal"
-        @click=${() => void toggleTerminalDock()}
+      <div
+        class="absolute top-3 z-10 flex items-center gap-2 transition-all"
+        style=${rightControlsStyle}
       >
-        ${icon(TerminalSquare, 'sm')}
-      </button>
+        <button
+          type="button"
+          class=${[
+            'flex h-9 w-9 items-center justify-center rounded-lg text-[#f5f5f5] transition-all hover:bg-[#3f3f3f]',
+            state.reviewSidebarOpen ? 'bg-[#3a3a3a]' : ''
+          ].join(' ')}
+          aria-label="Toggle review sidebar"
+          title="Toggle review sidebar (Cmd/Ctrl + Alt + B)"
+          @click=${toggleReviewSidebar}
+        >
+          ${icon(Diff, 'sm')}
+        </button>
+
+        <button
+          type="button"
+          class="flex h-9 w-9 items-center justify-center rounded-lg text-[#f5f5f5] transition-all hover:bg-[#3f3f3f]"
+          aria-label="Toggle terminal"
+          title="Toggle terminal"
+          @click=${() => void toggleTerminalDock()}
+        >
+          ${icon(TerminalSquare, 'sm')}
+        </button>
+      </div>
 
       ${renderSidebar(activeWorkspace, activeChat?.id ?? '')}
 
-      <main class="flex min-w-0 flex-1 bg-[#2f2f2f] pb-0 pt-6">
-        <div class="flex h-full w-full min-h-0 flex-col overflow-hidden">
-          <section class="flex min-h-0 flex-1 flex-col px-6">
-            <div class="flex min-h-0 flex-1 justify-center overflow-hidden">
-              <div
-                class="w-full max-w-[760px] overflow-y-auto px-1"
-                ${scrollToBottom()}
-                ${ref((element?: Element | null) => {
-                  chatScrollContainer = element instanceof HTMLDivElement ? element : null
-                })}
-              >
-                <div class="space-y-[18px] pt-16">
-                  ${
-                    activeChat
-                      ? activeChat.messages.map((message) => renderMessage(message))
-                      : renderNoWorkspaceState()
-                  }
+      <div class="flex min-w-0 flex-1">
+        <main class="flex min-w-0 flex-1 bg-[#2f2f2f] pb-0 pt-6">
+          <div class="flex h-full w-full min-h-0 flex-col overflow-hidden">
+            <section class="flex min-h-0 flex-1 flex-col px-6">
+              <div class="flex min-h-0 flex-1 overflow-hidden">
+                <div
+                  class="mx-auto w-full max-w-[760px] overflow-y-auto px-1"
+                  ${scrollToBottom()}
+                  ${ref((element?: Element | null) => {
+                    chatScrollContainer = element instanceof HTMLDivElement ? element : null
+                  })}
+                >
+                  <div class="space-y-[18px] pt-16">
+                    ${
+                      activeChat
+                        ? activeChat.messages.map((message) => renderMessage(message))
+                        : renderNoWorkspaceState()
+                    }
+                  </div>
                 </div>
               </div>
-            </div>
 
-            <div class="flex shrink-0 justify-center pb-1 pt-8">
-              <div
-                class="relative w-full max-w-[760px] rounded-[24px] border border-[#505050] bg-[#3a3a3a] px-[18px] pb-3 pt-2.5"
-              >
-                <textarea
-                  class="min-h-[74px] max-h-[210px] w-full resize-none overflow-y-hidden bg-transparent pb-1 text-[18px] font-medium leading-7 text-[#f5f5f5] outline-none placeholder:text-[#a3a3a3] disabled:cursor-not-allowed disabled:opacity-70"
-                  style="scrollbar-gutter: stable;"
-                  placeholder=${hasWorkspace ? 'Build anything' : 'Open a folder to start'}
-                  .value=${state.composer}
-                  ?disabled=${!activeChat}
-                  ${ref((element?: Element | null) => {
-                    composerTextarea = element instanceof HTMLTextAreaElement ? element : null
-                    queueMicrotask(syncComposerHeight)
-                  })}
-                  @input=${(event: Event) => {
-                    setComposer((event.target as HTMLTextAreaElement).value)
-                  }}
-                ></textarea>
-
-                <div class="mt-1.5 flex items-center justify-between gap-3 pt-1.5">
-                  <div class="flex min-w-0 flex-wrap items-center gap-2">
-                    ${Select({
-                      variant: 'ghost',
-                      value: state.selectedModelId,
-                      placeholder: 'Model',
-                      options: state.models.map((model) => ({
-                        value: model.id,
-                        label: model.name
-                      })),
-                      onChange: (value) => {
-                        setSelectedModelId(value)
-                      },
-                      disabled: !activeChat || state.models.length === 0 || isSending,
-                      width: '220px',
-                      size: 'md'
+              <div class="flex shrink-0 justify-center pb-1 pt-8">
+                <div
+                  class="relative w-full max-w-[760px] rounded-[24px] border border-[#505050] bg-[#3a3a3a] px-[18px] pb-3 pt-2.5"
+                >
+                  <textarea
+                    class="min-h-[74px] max-h-[210px] w-full resize-none overflow-y-hidden bg-transparent pb-1 text-[18px] font-medium leading-7 text-[#f5f5f5] outline-none placeholder:text-[#a3a3a3] disabled:cursor-not-allowed disabled:opacity-70"
+                    style="scrollbar-gutter: stable;"
+                    placeholder=${hasWorkspace ? 'Build anything' : 'Open a folder to start'}
+                    .value=${state.composer}
+                    ?disabled=${!activeChat}
+                    ${ref((element?: Element | null) => {
+                      composerTextarea = element instanceof HTMLTextAreaElement ? element : null
+                      queueMicrotask(syncComposerHeight)
                     })}
+                    @input=${(event: Event) => {
+                      setComposer((event.target as HTMLTextAreaElement).value)
+                    }}
+                  ></textarea>
 
-                    ${Select({
-                      variant: 'ghost',
-                      value: state.selectedThinkingLevel,
-                      placeholder: 'Thinking',
-                      options: THINKING_LEVELS.map((level) => ({
-                        value: level.id,
-                        label: level.label
-                      })),
-                      onChange: (value) => {
-                        setSelectedThinkingLevel(value as ThinkingLevel)
-                      },
-                      disabled: !activeChat || isSending,
-                      width: '170px',
-                      size: 'md'
-                    })}
-                  </div>
+                  <div class="mt-1.5 flex items-center justify-between gap-3 pt-1.5">
+                    <div class="flex min-w-0 flex-wrap items-center gap-2">
+                      ${Select({
+                        variant: 'ghost',
+                        value: state.selectedModelId,
+                        placeholder: 'Model',
+                        options: state.models.map((model) => ({
+                          value: model.id,
+                          label: model.name
+                        })),
+                        onChange: (value) => {
+                          setSelectedModelId(value)
+                        },
+                        disabled: !activeChat || state.models.length === 0 || isSending,
+                        width: '220px',
+                        size: 'md'
+                      })}
 
-                  <button
-                    type="button"
-                    class="shrink-0 flex h-11 w-11 items-center justify-center bg-transparent text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    title=${
+                      ${Select({
+                        variant: 'ghost',
+                        value: state.selectedThinkingLevel,
+                        placeholder: 'Thinking',
+                        options: THINKING_LEVELS.map((level) => ({
+                          value: level.id,
+                          label: level.label
+                        })),
+                        onChange: (value) => {
+                          setSelectedThinkingLevel(value as ThinkingLevel)
+                        },
+                        disabled: !activeChat || isSending,
+                        width: '170px',
+                        size: 'md'
+                      })}
+                    </div>
+
+                    <button
+                      type="button"
+                      class="shrink-0 flex h-11 w-11 items-center justify-center bg-transparent text-white disabled:cursor-not-allowed disabled:opacity-50"
+                      title=${
+                        isSending
+                          ? 'Assistant responding. This becomes a stop control.'
+                          : 'Send message'
+                      }
+                      ?disabled=${(!state.composer.trim() || !activeChat) && !isSending}
+                      @click=${() => void sendMessage()}
+                    >
+                    ${
                       isSending
-                        ? 'Assistant responding. This becomes a stop control.'
-                        : 'Send message'
+                        ? html`
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              width="20"
+                              height="20"
+                              viewBox="0 0 24 24"
+                              fill="currentColor"
+                            >
+                              <rect x="6" y="6" width="12" height="12" rx="1" />
+                            </svg>
+                          `
+                        : html`
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              width="32"
+                              height="32"
+                              viewBox="0 0 24 24"
+                              fill="currentColor"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12.02 7l-.163.01l-.086.016l-.142.045l-.113.054l-.07.043l-.095.071l-.058.054l-4 4l-.083.094a1 1 0 0 0 1.497 1.32L11 10.414V16l.007.117A1 1 0 0 0 13 16v-5.585l2.293 2.292l.094.083a1 1 0 0 0 1.32-1.497l-4-4l-.082-.073l-.089-.064l-.113-.062l-.081-.034l-.113-.034l-.112-.02z"
+                              />
+                            </svg>
+                          `
                     }
-                    ?disabled=${(!state.composer.trim() || !activeChat) && !isSending}
-                    @click=${() => void sendMessage()}
-                  >
-                  ${
-                    isSending
-                      ? html`
-                          <svg
-                            xmlns="http://www.w3.org/2000/svg"
-                            width="20"
-                            height="20"
-                            viewBox="0 0 24 24"
-                            fill="currentColor"
-                          >
-                            <rect x="6" y="6" width="12" height="12" rx="1" />
-                          </svg>
-                        `
-                      : html`
-                          <svg
-                            xmlns="http://www.w3.org/2000/svg"
-                            width="32"
-                            height="32"
-                            viewBox="0 0 24 24"
-                            fill="currentColor"
-                            aria-hidden="true"
-                          >
-                            <path
-                              d="M17 3.34a10 10 0 1 1-14.995 8.984L2 12l.005-.324A10 10 0 0 1 17 3.34M12.02 7l-.163.01l-.086.016l-.142.045l-.113.054l-.07.043l-.095.071l-.058.054l-4 4l-.083.094a1 1 0 0 0 1.497 1.32L11 10.414V16l.007.117A1 1 0 0 0 13 16v-5.585l2.293 2.292l.094.083a1 1 0 0 0 1.32-1.497l-4-4l-.082-.073l-.089-.064l-.113-.062l-.081-.034l-.113-.034l-.112-.02z"
-                            />
-                          </svg>
-                        `
-                  }
-                </button>
+                  </button>
+                </div>
               </div>
-            </div>
-          </section>
+            </section>
 
-          ${renderTerminalDock()}
-        </div>
-      </main>
+            ${renderTerminalDock()}
+          </div>
+        </main>
+
+        ${renderReviewSidebar(activeWorkspace)}
+      </div>
 
       ${Dialog({
         isOpen: state.settingsDialogOpen,

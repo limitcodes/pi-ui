@@ -58,11 +58,22 @@ type TerminalEvent =
   | { type: 'output'; terminalId: string; data: string }
   | { type: 'exit'; terminalId: string; exitCode: number | null }
 
+type ReviewFile = {
+  path: string
+  oldText: string
+  newText: string
+  added: number
+  removed: number
+}
+
 interface PiDesktopApi {
   getAuthState: () => Promise<AuthState>
   loginCodex: () => Promise<{ ok: true; state: AuthState } | { ok: false; error: string }>
   logoutCodex: () => Promise<{ ok: true; state: AuthState } | { ok: false; error: string }>
   openFolder: () => Promise<{ path: string; name: string } | null>
+  getWorkspaceDiff: (payload: {
+    cwd: string
+  }) => Promise<{ ok: true; files: ReviewFile[] } | { ok: false; error: string }>
   sendChatMessage: (payload: {
     chatId: string
     cwd: string

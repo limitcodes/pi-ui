@@ -59,6 +59,14 @@ type TerminalEvent =
   | { type: 'output'; terminalId: string; data: string }
   | { type: 'exit'; terminalId: string; exitCode: number | null }
 
+type ReviewFile = {
+  path: string
+  oldText: string
+  newText: string
+  added: number
+  removed: number
+}
+
 const api = {
   getAuthState: async (): Promise<AuthState> => {
     return ipcRenderer.invoke('auth:get-state')
@@ -71,6 +79,11 @@ const api = {
   },
   openFolder: async (): Promise<{ path: string; name: string } | null> => {
     return ipcRenderer.invoke('dialog:open-folder')
+  },
+  getWorkspaceDiff: async (payload: {
+    cwd: string
+  }): Promise<{ ok: true; files: ReviewFile[] } | { ok: false; error: string }> => {
+    return ipcRenderer.invoke('review:get-workspace-diff', payload)
   },
   sendChatMessage: async (payload: {
     chatId: string
