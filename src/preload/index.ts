@@ -41,6 +41,10 @@ type AgentStreamEvent =
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
 
+type ChatNotificationClickEvent = {
+  chatId: string
+}
+
 type TerminalSessionSummary = {
   id: string
   title: string
@@ -76,12 +80,29 @@ const api = {
       { ok: true; requestId: string } | { ok: false; error: string }
     >
   },
+  showChatNotification: async (payload: {
+    chatId: string
+    title: string
+    body: string
+  }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    return ipcRenderer.invoke('chat:show-notification', payload)
+  },
   onAgentStreamEvent: (listener: (event: AgentStreamEvent) => void): (() => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentStreamEvent): void =>
       listener(payload)
     ipcRenderer.on('agent:stream-event', wrapped)
     return () => {
       ipcRenderer.removeListener('agent:stream-event', wrapped)
+    }
+  },
+  onChatNotificationClick: (
+    listener: (event: ChatNotificationClickEvent) => void
+  ): (() => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, payload: ChatNotificationClickEvent): void =>
+      listener(payload)
+    ipcRenderer.on('chat-notification:click', wrapped)
+    return () => {
+      ipcRenderer.removeListener('chat-notification:click', wrapped)
     }
   },
   listTerminals: async (): Promise<TerminalSessionSummary[]> => {

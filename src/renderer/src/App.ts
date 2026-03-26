@@ -87,6 +87,10 @@ type AgentStreamEvent =
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
 
+type ChatNotificationClickEvent = {
+  chatId: string
+}
+
 type TerminalSessionSummary = {
   id: string
   title: string
@@ -327,6 +331,7 @@ let notifyChange: (() => void) | undefined
 let folderPickerInFlight = false
 let unsubscribeStream: (() => void) | undefined
 let unsubscribeTerminal: (() => void) | undefined
+let unsubscribeChatNotificationClick: (() => void) | undefined
 let composerTextarea: HTMLTextAreaElement | null = null
 let chatScrollContainer: HTMLDivElement | null = null
 const terminalInstances = new Map<string, { terminal: XTerm; fitAddon: FitAddon }>()
@@ -576,11 +581,28 @@ export const setTerminalCleanup = (
   })
 }
 
+export const setChatNotificationCleanup = (
+  subscribe: (listener: (event: ChatNotificationClickEvent) => void) => () => void
+): void => {
+  unsubscribeChatNotificationClick?.()
+  unsubscribeChatNotificationClick = subscribe((event) => {
+    selectChat(event.chatId)
+  })
+}
+
 export const setStreamCleanup = (
   subscribe: (listener: (event: AgentStreamEvent) => void) => () => void
 ): void => {
   unsubscribeStream?.()
   unsubscribeStream = subscribe((event) => {
+    let notification:
+      | {
+          chatId: string
+          title: string
+          body: string
+        }
+      | undefined
+
     updateState((current) => {
       const runState = getChatRunState(current, event.chatId)
       if (!runState) {
@@ -667,6 +689,16 @@ export const setStreamCleanup = (
           ...message,
           streaming: false
         }))
+        const hasUnreadCompletion = current.activeChatId !== event.chatId
+        const chat = getChatById(event.chatId, nextState)
+
+        if (hasUnreadCompletion && chat) {
+          notification = {
+            chatId: event.chatId,
+            title: chat.title,
+            body: 'Response finished'
+          }
+        }
 
         return {
           ...nextState,
@@ -685,7 +717,7 @@ export const setStreamCleanup = (
             [event.chatId]: {
               ...runState,
               status: 'completed',
-              hasUnreadCompletion: current.activeChatId !== event.chatId
+              hasUnreadCompletion
             }
           }
         }
@@ -697,6 +729,16 @@ export const setStreamCleanup = (
           content: message.content || `Agent error: ${event.error}`,
           streaming: false
         }))
+        const hasUnreadCompletion = current.activeChatId !== event.chatId
+        const chat = getChatById(event.chatId, nextState)
+
+        if (hasUnreadCompletion && chat) {
+          notification = {
+            chatId: event.chatId,
+            title: chat.title,
+            body: 'Response ended with an error'
+          }
+        }
 
         return {
           ...nextState,
@@ -715,7 +757,7 @@ export const setStreamCleanup = (
             [event.chatId]: {
               ...runState,
               status: 'error',
-              hasUnreadCompletion: false
+              hasUnreadCompletion
             }
           }
         }
@@ -723,6 +765,10 @@ export const setStreamCleanup = (
 
       return current
     })
+
+    if (notification) {
+      void window.api.showChatNotification(notification)
+    }
   })
 }
 
@@ -860,6 +906,10 @@ const getActiveWorkspace = (): Workspace => {
 
 const getActiveChat = (): Chat | undefined => {
   return state.chats.find((chat) => chat.id === state.activeChatId)
+}
+
+const getChatById = (chatId: string, current: AppState = state): Chat | undefined => {
+  return current.chats.find((chat) => chat.id === chatId)
 }
 
 const createChatForWorkspace = (workspacePath: string): void => {
@@ -1292,12 +1342,12 @@ const renderTablerPlus = (className = 'h-4 w-4'): TemplateResult => html`
 
 const renderChatStatusIndicator = (chatId: string, isActive: boolean): TemplateResult => {
   const runState = getChatRunState(state, chatId)
-  const isBackgroundRunning = runState?.status === 'running' && !isActive
+  const isRunning = runState?.status === 'running'
   const showCompleted = Boolean(runState?.hasUnreadCompletion && !isActive)
 
   return html`
     <span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
-      ${isBackgroundRunning
+      ${isRunning
         ? icon(LoaderCircle, 'xs', 'h-3.5 w-3.5 animate-spin text-[#8ab4ff]')
         : showCompleted
           ? html`<span class="h-1.5 w-1.5 rounded-full bg-[#4da3ff]"></span>`

@@ -40,6 +40,10 @@ type AgentStreamEvent =
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
 
+type ChatNotificationClickEvent = {
+  chatId: string
+}
+
 interface TerminalSessionSummary {
   id: string
   title: string
@@ -65,14 +69,27 @@ interface PiDesktopApi {
     modelId: string
     thinkingLevel: ThinkingLevel
   }) => Promise<{ ok: true; requestId: string } | { ok: false; error: string }>
+  showChatNotification: (payload: {
+    chatId: string
+    title: string
+    body: string
+  }) => Promise<{ ok: true } | { ok: false; error: string }>
   onAgentStreamEvent: (listener: (event: AgentStreamEvent) => void) => () => void
+  onChatNotificationClick: (listener: (event: ChatNotificationClickEvent) => void) => () => void
   listTerminals: () => Promise<TerminalSessionSummary[]>
   createTerminal: (payload: {
     cwd?: string
     title?: string
   }) => Promise<{ ok: true; terminal: TerminalSessionSummary } | { ok: false; error: string }>
-  writeTerminal: (payload: { terminalId: string; data: string }) => Promise<{ ok: true } | { ok: false; error: string }>
-  resizeTerminal: (payload: { terminalId: string; cols: number; rows: number }) => Promise<{ ok: true } | { ok: false; error: string }>
+  writeTerminal: (payload: {
+    terminalId: string
+    data: string
+  }) => Promise<{ ok: true } | { ok: false; error: string }>
+  resizeTerminal: (payload: {
+    terminalId: string
+    cols: number
+    rows: number
+  }) => Promise<{ ok: true } | { ok: false; error: string }>
   closeTerminal: (payload: { terminalId: string }) => Promise<{ ok: true } | { ok: false; error: string }>
   onTerminalEvent: (listener: (event: TerminalEvent) => void) => () => void
 }

@@ -1,4 +1,12 @@
-import { app, BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions } from 'electron'
+import {
+  Notification,
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  shell,
+  type OpenDialogOptions
+} from 'electron'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
@@ -91,6 +99,10 @@ type StreamEvent =
   | { type: 'end'; chatId: string; requestId: string }
   | { type: 'error'; chatId: string; requestId: string; error: string }
 
+type ChatNotificationClickEvent = {
+  chatId: string
+}
+
 let mainWindow: BrowserWindow | null = null
 const authStorage = AuthStorage.create(join(app.getPath('userData'), 'auth.json'))
 const modelRegistry = new ModelRegistry(authStorage)
@@ -104,6 +116,48 @@ const emitStreamEvent = (payload: StreamEvent): void => {
 
 const emitTerminalEvent = (payload: TerminalEvent): void => {
   mainWindow?.webContents.send('terminal:event', payload)
+}
+
+const emitChatNotificationClickEvent = (payload: ChatNotificationClickEvent): void => {
+  mainWindow?.webContents.send('chat-notification:click', payload)
+}
+
+const focusMainWindow = (): void => {
+  if (!mainWindow) return
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore()
+  }
+
+  if (!mainWindow.isVisible()) {
+    mainWindow.show()
+  }
+
+  mainWindow.focus()
+}
+
+const showChatCompletionNotification = ({
+  chatId,
+  title,
+  body
+}: {
+  chatId: string
+  title: string
+  body: string
+}): void => {
+  if (!Notification.isSupported()) return
+
+  const notification = new Notification({
+    title,
+    body
+  })
+
+  notification.on('click', () => {
+    focusMainWindow()
+    emitChatNotificationClickEvent({ chatId })
+  })
+
+  notification.show()
 }
 
 const toTerminalSummary = (terminal: TerminalRecord): TerminalSessionSummary => ({
@@ -537,6 +591,26 @@ app.whenReady().then(() => {
           requestId
         )
         return { ok: true as const, requestId }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { ok: false as const, error: message }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'chat:show-notification',
+    async (
+      _event,
+      payload: {
+        chatId: string
+        title: string
+        body: string
+      }
+    ) => {
+      try {
+        showChatCompletionNotification(payload)
+        return { ok: true as const }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { ok: false as const, error: message }
