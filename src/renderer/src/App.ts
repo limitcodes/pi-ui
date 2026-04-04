@@ -1807,6 +1807,21 @@ const onGlobalKeyDown = (event: KeyboardEvent): void => {
   if (modifier && event.code === 'KeyO' && state.loggedIn && !isTextInput) {
     event.preventDefault()
     void openFolder()
+    return
+  }
+
+  if (modifier && event.shiftKey && event.code === 'KeyM' && state.loggedIn) {
+    event.preventDefault()
+    const btn = document.querySelector('.model-select-btn') as HTMLButtonElement | null
+    if (btn) btn.click()
+    return
+  }
+
+  if (modifier && !event.shiftKey && !event.altKey && event.code === 'KeyT' && state.loggedIn) {
+    event.preventDefault()
+    const btn = document.querySelector('.thinking-select-btn') as HTMLButtonElement | null
+    if (btn) btn.click()
+    return
   }
 }
 
@@ -2639,6 +2654,7 @@ export const App = (): TemplateResult => {
                   <div class="mt-1.5 flex items-center justify-between gap-3 pt-1.5">
                     <div class="flex min-w-0 flex-wrap items-center gap-2">
                       ${Select({
+                        className: 'model-select-btn',
                         variant: 'ghost',
                         value: state.selectedModelId,
                         placeholder: 'Model',
@@ -2650,11 +2666,12 @@ export const App = (): TemplateResult => {
                           setSelectedModelId(value)
                         },
                         disabled: !activeChat || state.models.length === 0 || isSending,
-                        width: '220px',
+                        width: 'auto',
                         size: 'md'
                       })}
 
                       ${Select({
+                        className: 'thinking-select-btn',
                         variant: 'ghost',
                         value: state.selectedThinkingLevel,
                         placeholder: 'Thinking',
@@ -2666,7 +2683,7 @@ export const App = (): TemplateResult => {
                           setSelectedThinkingLevel(value as ThinkingLevel)
                         },
                         disabled: !activeChat || isSending,
-                        width: '170px',
+                        width: 'auto',
                         size: 'md'
                       })}
                     </div>
