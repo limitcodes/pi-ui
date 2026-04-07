@@ -23,6 +23,8 @@ mac:
   hardenedRuntime: false
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
+    - CFBundleName: Vector
+    - CFBundleDisplayName: Vector
     - NSCameraUsageDescription: Application requests access to the device's camera.
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
     - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.

@@ -151,6 +151,8 @@ type ReviewFile = {
 }
 
 let mainWindow: BrowserWindow | null = null
+
+app.setName('Vector')
 const authStorage = AuthStorage.create(join(app.getPath('userData'), 'auth.json'))
 const modelRegistry = new ModelRegistry(authStorage)
 const sessionCache = new Map<string, PiSession>()
