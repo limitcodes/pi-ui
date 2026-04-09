@@ -9,7 +9,7 @@ import {
 } from 'electron'
 import { execFile } from 'child_process'
 import { readFile } from 'fs/promises'
-import { homedir } from 'os'
+import { homedir, release } from 'os'
 import { basename, join, resolve } from 'path'
 import { promisify } from 'util'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
@@ -156,6 +156,7 @@ app.setName('Vector')
 const authStorage = AuthStorage.create(join(app.getPath('userData'), 'auth.json'))
 const modelRegistry = new ModelRegistry(authStorage)
 const sessionCache = new Map<string, PiSession>()
+const hiddenReminderInjectedChats = new Set<string>()
 const terminalSessions = new Map<string, TerminalRecord>()
 let terminalSequence = 0
 const execFileAsync = promisify(execFile)
@@ -707,6 +708,86 @@ const extractAssistantText = (messages: unknown[]): string => {
   return ''
 }
 
+const getReminderCommandOutput = async (cwd: string, command: string): Promise<string> => {
+  try {
+    const { stdout, stderr } = await execFileAsync('/bin/sh', ['-lc', command], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024
+    })
+    const output = `${stdout ?? ''}${stderr ?? ''}`.trim()
+    if (output) return output
+
+    if (command.startsWith('which ')) {
+      const tool = command.slice('which '.length).trim()
+      return `${tool} not found`
+    }
+
+    return '(no output)'
+  } catch (error) {
+    const execError = error as {
+      stdout?: string
+      stderr?: string
+      message?: string
+    }
+    const output = `${execError.stdout ?? ''}${execError.stderr ?? ''}`.trim()
+    if (output) return output
+
+    if (command.startsWith('which ')) {
+      const tool = command.slice('which '.length).trim()
+      return `${tool} not found`
+    }
+
+    return execError.message ?? String(error)
+  }
+}
+
+const buildHiddenSystemReminder = async (cwd: string): Promise<string> => {
+  const commands = [
+    'pwd',
+    'ls',
+    'git rev-parse --abbrev-ref HEAD',
+    'git status --porcelain',
+    'git log --oneline -5',
+    'git symbolic-ref refs/remotes/origin/HEAD',
+    'git --version',
+    'rg --version',
+    'gh --version',
+    'which wget',
+    'curl --version',
+    'ffmpeg -version',
+    'python3 --version',
+    'jupyter --config-dir',
+    'ls /.dockerenv'
+  ]
+
+  const sections: string[] = []
+  for (const command of commands) {
+    const output = await getReminderCommandOutput(cwd, command)
+    sections.push(`% ${command}\n${output}`)
+  }
+
+  return `<system-reminder>\n\nUser system info (${process.platform} ${release()})\nToday's date: ${new Date().toISOString().slice(0, 10)}\n\n# The commands below were executed at the start of all sessions to gather context about the environment.\n# You do not need to repeat them, unless you think the environment has changed.\n# Remember: They are not necessarily related to the current conversation, but may be useful for context.\n\n${sections.join('\n\n')}\n\nIMPORTANT:\n- Double check the tools installed in the environment before using them.\n- Never call a file editing tool for the same file in parallel.\n- Always prefer using the absolute paths when using tools, to avoid any ambiguity.\n\n</system-reminder>`
+}
+
+const ensureHiddenSystemReminder = async (session: PiSession, chatId: string, cwd: string): Promise<void> => {
+  if (hiddenReminderInjectedChats.has(chatId)) {
+    return
+  }
+
+  const reminder = await buildHiddenSystemReminder(cwd)
+  console.log('[vector:first-request:hidden-user-message]', { chatId, cwd, reminder })
+  await session.sendCustomMessage(
+    {
+      customType: 'system-reminder',
+      content: [{ type: 'text', text: reminder }],
+      display: false
+    },
+    { triggerTurn: false }
+  )
+  hiddenReminderInjectedChats.add(chatId)
+}
+
 const getOrCreateSession = async (
   chatId: string,
   cwd: string,
@@ -834,6 +915,7 @@ const streamPrompt = async (
   })
 
   try {
+    await ensureHiddenSystemReminder(session, chatId, cwd)
     await session.prompt(prompt)
     if (!text.trim()) {
       const fallback = extractAssistantText(session.messages as unknown[])
@@ -911,6 +993,7 @@ app.whenReady().then(() => {
       authStorage.logout('openai-codex')
       modelRegistry.refresh()
       sessionCache.clear()
+      hiddenReminderInjectedChats.clear()
       return { ok: true as const, state: getAuthState() }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

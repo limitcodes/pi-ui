@@ -4,7 +4,7 @@
 
 ~~Terminal integrations (Cmd + J)~~
 
-Build Vector/kronos agent (pi externsion has gone through a refactor so need to update the package)
+~~Build Vector agent~~
 
 system reminders + linters (hidden user messages)
 
