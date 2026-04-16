@@ -3,6 +3,13 @@ import { electronAPI } from '@electron-toolkit/preload'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
+type PromptImageAttachment = {
+  type: 'image'
+  mimeType: string
+  data: string
+  name?: string
+}
+
 type AuthState = {
   loggedIn: boolean
   models: Array<{ id: string; name: string }>
@@ -108,6 +115,7 @@ const api = {
     chatId: string
     cwd: string
     prompt: string
+    images?: PromptImageAttachment[]
     modelId: string
     thinkingLevel: ThinkingLevel
   }): Promise<{ ok: true; requestId: string } | { ok: false; error: string }> => {
@@ -140,8 +148,10 @@ const api = {
   onChatNotificationClick: (
     listener: (event: ChatNotificationClickEvent) => void
   ): (() => void) => {
-    const wrapped = (_event: Electron.IpcRendererEvent, payload: ChatNotificationClickEvent): void =>
-      listener(payload)
+    const wrapped = (
+      _event: Electron.IpcRendererEvent,
+      payload: ChatNotificationClickEvent
+    ): void => listener(payload)
     ipcRenderer.on('chat-notification:click', wrapped)
     return () => {
       ipcRenderer.removeListener('chat-notification:click', wrapped)

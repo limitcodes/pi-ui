@@ -2,6 +2,13 @@ import { ElectronAPI } from '@electron-toolkit/preload'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
+type PromptImageAttachment = {
+  type: 'image'
+  mimeType: string
+  data: string
+  name?: string
+}
+
 interface AuthState {
   loggedIn: boolean
   models: Array<{ id: string; name: string }>
@@ -97,6 +104,7 @@ interface PiDesktopApi {
     chatId: string
     cwd: string
     prompt: string
+    images?: PromptImageAttachment[]
     modelId: string
     thinkingLevel: ThinkingLevel
   }) => Promise<{ ok: true; requestId: string } | { ok: false; error: string }>
@@ -127,7 +135,9 @@ interface PiDesktopApi {
     cols: number
     rows: number
   }) => Promise<{ ok: true } | { ok: false; error: string }>
-  closeTerminal: (payload: { terminalId: string }) => Promise<{ ok: true } | { ok: false; error: string }>
+  closeTerminal: (payload: {
+    terminalId: string
+  }) => Promise<{ ok: true } | { ok: false; error: string }>
   onTerminalEvent: (listener: (event: TerminalEvent) => void) => () => void
 }
 

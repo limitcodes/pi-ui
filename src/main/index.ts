@@ -13,7 +13,7 @@ import { homedir, release } from 'os'
 import { basename, join, resolve } from 'path'
 import { promisify } from 'util'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
-import { Type } from '@mariozechner/pi-ai'
+import { Type, type ImageContent } from '@mariozechner/pi-ai'
 import { spawn, type IPty } from 'node-pty'
 import * as Diff from 'diff'
 import {
@@ -253,7 +253,8 @@ const createQuestionTool = (chatId: string): ToolDefinition => ({
   label: 'Question',
   description:
     'Ask the user 1-4 short multiple-choice clarification questions and receive structured answers.',
-  promptSnippet: 'Ask the user a short multiple-choice questionnaire when clarification is required.',
+  promptSnippet:
+    'Ask the user a short multiple-choice questionnaire when clarification is required.',
   parameters: Type.Object({
     questionnaire: Type.String({
       description:
@@ -652,6 +653,27 @@ const safeStringify = (value: unknown): string => {
   }
 }
 
+const normalizePromptImages = (value: unknown): ImageContent[] => {
+  if (!Array.isArray(value)) return []
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+
+      const record = entry as { type?: unknown; mimeType?: unknown; data?: unknown }
+      if (record.type !== 'image') return null
+      if (typeof record.mimeType !== 'string' || !record.mimeType.trim()) return null
+      if (typeof record.data !== 'string' || !record.data.trim()) return null
+
+      return {
+        type: 'image' as const,
+        mimeType: record.mimeType,
+        data: record.data
+      }
+    })
+    .filter((entry): entry is ImageContent => Boolean(entry))
+}
+
 const extractTextFromToolPayload = (value: unknown): string => {
   if (typeof value === 'string') return value
   if (!value || typeof value !== 'object') return safeStringify(value)
@@ -664,7 +686,9 @@ const extractTextFromToolPayload = (value: unknown): string => {
   }
 
   if (typeof record.stdout === 'string' || typeof record.stderr === 'string') {
-    return [record.stdout, record.stderr].filter(Boolean).join(record.stdout && record.stderr ? '\n' : '')
+    return [record.stdout, record.stderr]
+      .filter(Boolean)
+      .join(record.stdout && record.stderr ? '\n' : '')
   }
 
   if (typeof record.output === 'string') return record.output
@@ -770,7 +794,11 @@ const buildHiddenSystemReminder = async (cwd: string): Promise<string> => {
   return `<system-reminder>\n\nUser system info (${process.platform} ${release()})\nToday's date: ${new Date().toISOString().slice(0, 10)}\n\n# The commands below were executed at the start of all sessions to gather context about the environment.\n# You do not need to repeat them, unless you think the environment has changed.\n# Remember: They are not necessarily related to the current conversation, but may be useful for context.\n\n${sections.join('\n\n')}\n\nIMPORTANT:\n- Double check the tools installed in the environment before using them.\n- Never call a file editing tool for the same file in parallel.\n- Always prefer using the absolute paths when using tools, to avoid any ambiguity.\n\n</system-reminder>`
 }
 
-const ensureHiddenSystemReminder = async (session: PiSession, chatId: string, cwd: string): Promise<void> => {
+const ensureHiddenSystemReminder = async (
+  session: PiSession,
+  chatId: string,
+  cwd: string
+): Promise<void> => {
   if (hiddenReminderInjectedChats.has(chatId)) {
     return
   }
@@ -846,6 +874,7 @@ const streamPrompt = async (
   chatId: string,
   cwd: string,
   prompt: string,
+  images: ImageContent[],
   modelId: string,
   thinkingLevel: ThinkingLevel,
   requestId: string
@@ -916,7 +945,7 @@ const streamPrompt = async (
 
   try {
     await ensureHiddenSystemReminder(session, chatId, cwd)
-    await session.prompt(prompt)
+    await session.prompt(prompt, images.length > 0 ? { images } : undefined)
     if (!text.trim()) {
       const fallback = extractAssistantText(session.messages as unknown[])
       if (fallback) {
@@ -1039,6 +1068,7 @@ app.whenReady().then(() => {
         chatId: string
         cwd: string
         prompt: string
+        images?: ImageContent[]
         modelId: string
         thinkingLevel: ThinkingLevel
       }
@@ -1049,6 +1079,7 @@ app.whenReady().then(() => {
           payload.chatId,
           payload.cwd,
           payload.prompt,
+          normalizePromptImages(payload.images),
           payload.modelId,
           payload.thinkingLevel,
           requestId
@@ -1061,18 +1092,15 @@ app.whenReady().then(() => {
     }
   )
 
-  ipcMain.handle(
-    'question:submit',
-    async (_event, payload: QuestionSubmitPayload) => {
-      const request = pendingQuestionRequests.get(payload.toolCallId)
-      if (!request) {
-        return { ok: false as const, error: 'Question request not found' }
-      }
-
-      request.resolve(payload)
-      return { ok: true as const }
+  ipcMain.handle('question:submit', async (_event, payload: QuestionSubmitPayload) => {
+    const request = pendingQuestionRequests.get(payload.toolCallId)
+    if (!request) {
+      return { ok: false as const, error: 'Question request not found' }
     }
-  )
+
+    request.resolve(payload)
+    return { ok: true as const }
+  })
 
   ipcMain.handle(
     'chat:show-notification',

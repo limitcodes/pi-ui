@@ -35,6 +35,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  ImagePlus,
   LoaderCircle,
   PanelLeftClose,
   PanelLeftOpen,
@@ -42,7 +43,8 @@ import {
   Settings,
   SquarePen,
   TerminalSquare,
-  Trash2
+  Trash2,
+  X
 } from 'lucide'
 
 type Role = 'user' | 'assistant'
@@ -53,6 +55,21 @@ type ModelOption = {
 }
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+type PromptImageAttachment = {
+  type: 'image'
+  mimeType: string
+  data: string
+  name?: string
+}
+
+type ComposerImage = {
+  id: string
+  name: string
+  mimeType: string
+  data: string
+  previewUrl: string
+}
 
 const THINKING_LEVELS: Array<{ id: ThinkingLevel; label: string }> = [
   { id: 'off', label: 'off' },
@@ -205,6 +222,7 @@ interface ChatRunState {
 
 interface AppState extends PersistedState {
   composer: string
+  composerImages: ComposerImage[]
   chatRunStateByChatId: Record<string, ChatRunState>
   authChecked: boolean
   loggedIn: boolean
@@ -348,6 +366,7 @@ const loadState = (): AppState => {
         selectedModelId: parsed.selectedModelId ?? 'gpt-5.4',
         selectedThinkingLevel: parsed.selectedThinkingLevel ?? 'medium',
         composer: '',
+        composerImages: [],
         chatRunStateByChatId: {},
         authChecked: false,
         loggedIn: false,
@@ -382,6 +401,7 @@ const loadState = (): AppState => {
     selectedModelId: 'gpt-5.4',
     selectedThinkingLevel: 'medium',
     composer: '',
+    composerImages: [],
     chatRunStateByChatId: {},
     authChecked: false,
     loggedIn: false,
@@ -413,6 +433,7 @@ let unsubscribeTerminal: (() => void) | undefined
 let unsubscribeChatNotificationClick: (() => void) | undefined
 let unsubscribeQuestionPrompt: (() => void) | undefined
 let composerTextarea: HTMLTextAreaElement | null = null
+let composerFileInput: HTMLInputElement | null = null
 let chatScrollContainer: HTMLDivElement | null = null
 const terminalInstances = new Map<string, { terminal: XTerm; fitAddon: FitAddon }>()
 const terminalMounts = new Map<string, HTMLDivElement>()
@@ -436,6 +457,47 @@ const focusComposer = (): void => {
   queueMicrotask(() => {
     composerTextarea?.focus()
   })
+}
+
+const revokeComposerImagePreviews = (images: ComposerImage[]): void => {
+  for (const image of images) {
+    URL.revokeObjectURL(image.previewUrl)
+  }
+}
+
+const readFileAsDataUrl = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`))
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error(`Failed to read ${file.name}`))
+        return
+      }
+      resolve(reader.result)
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
+const createComposerImageFromFile = async (file: File): Promise<ComposerImage | null> => {
+  if (!file.type || !file.type.startsWith('image/')) {
+    return null
+  }
+
+  const dataUrl = await readFileAsDataUrl(file)
+  const match = dataUrl.match(/^data:(.+?);base64,(.+)$/)
+  if (!match) {
+    throw new Error(`Unsupported image format for ${file.name}`)
+  }
+
+  return {
+    id: createId(),
+    name: file.name,
+    mimeType: match[1],
+    data: match[2],
+    previewUrl: URL.createObjectURL(file)
+  }
 }
 
 const scrollActiveChatToBottom = (): void => {
@@ -1075,8 +1137,7 @@ const renderInlineQuestionPrompt = (prompt: QuestionPromptState): TemplateResult
                   customAnswer: checked ? '' : currentDraft.customAnswer
                 }))
               },
-              className:
-                'rounded-md border border-white/8 bg-black/10 px-3 py-2 text-sm text-white'
+              className: 'rounded-md border border-white/8 bg-black/10 px-3 py-2 text-sm text-white'
             })
           )}
         </div>
@@ -1296,6 +1357,57 @@ const setComposer = (value: string): void => {
   queueMicrotask(syncComposerHeight)
 }
 
+const removeComposerImage = (imageId: string): void => {
+  updateState((current) => {
+    const image = current.composerImages.find((entry) => entry.id === imageId)
+    if (!image) return current
+
+    URL.revokeObjectURL(image.previewUrl)
+    return {
+      ...current,
+      composerImages: current.composerImages.filter((entry) => entry.id !== imageId)
+    }
+  })
+}
+
+const handleComposerImageFiles = async (files: FileList | null): Promise<void> => {
+  if (!files || files.length === 0) return
+
+  const nextImages: ComposerImage[] = []
+  for (const file of Array.from(files)) {
+    try {
+      const image = await createComposerImageFromFile(file)
+      if (image) {
+        nextImages.push(image)
+      }
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
+  if (nextImages.length === 0) return
+
+  updateState((current) => ({
+    ...current,
+    composerImages: [...current.composerImages, ...nextImages]
+  }))
+}
+
+const openComposerImagePicker = (): void => {
+  composerFileInput?.click()
+}
+
+const resetComposerImages = (current: AppState): AppState => {
+  if (current.composerImages.length > 0) {
+    revokeComposerImagePreviews(current.composerImages)
+  }
+
+  return {
+    ...current,
+    composerImages: []
+  }
+}
+
 const setSelectedModelId = (value: string): void => {
   updateState((current) => ({
     ...current,
@@ -1329,13 +1441,16 @@ const createChatForWorkspace = (workspacePath: string): void => {
   if (workspace.path === DEFAULT_WORKSPACE_PATH) return
 
   const chat = createChat(workspace)
-  updateState((current) => ({
-    ...current,
-    activeWorkspacePath: workspace.path,
-    activeChatId: chat.id,
-    chats: sortChats([chat, ...current.chats]),
-    composer: ''
-  }))
+  updateState((current) => {
+    const next = resetComposerImages(current)
+    return {
+      ...next,
+      activeWorkspacePath: workspace.path,
+      activeChatId: chat.id,
+      chats: sortChats([chat, ...next.chats]),
+      composer: ''
+    }
+  })
   focusComposer()
   scrollActiveChatToBottom()
   scheduleReviewRefresh({ immediate: true, force: true })
@@ -1585,18 +1700,21 @@ const logoutCodex = async (): Promise<void> => {
     return
   }
 
-  updateState((current) => ({
-    ...current,
-    authBusy: false,
-    authChecked: true,
-    loggedIn: result.state.loggedIn,
-    models: result.state.models,
-    selectedModelId: result.state.models.some((model) => model.id === current.selectedModelId)
-      ? current.selectedModelId
-      : result.state.defaultModelId,
-    authError: null,
-    settingsDialogOpen: false
-  }))
+  updateState((current) => {
+    const next = resetComposerImages(current)
+    return {
+      ...next,
+      authBusy: false,
+      authChecked: true,
+      loggedIn: result.state.loggedIn,
+      models: result.state.models,
+      selectedModelId: result.state.models.some((model) => model.id === next.selectedModelId)
+        ? next.selectedModelId
+        : result.state.defaultModelId,
+      authError: null,
+      settingsDialogOpen: false
+    }
+  })
 }
 
 const openFolder = async (): Promise<void> => {
@@ -1622,9 +1740,10 @@ const openFolder = async (): Promise<void> => {
       const activeChat = existingChats[0] ?? createChat(workspace)
       const chats = existingChats[0] ? current.chats : sortChats([activeChat, ...current.chats])
 
+      const next = resetComposerImages(current)
       return clearChatCompletionState(
         {
-          ...current,
+          ...next,
           workspaces,
           chats,
           activeWorkspacePath: folder.path,
@@ -1646,9 +1765,10 @@ const sendMessage = async (): Promise<void> => {
   const activeChat = getActiveChat()
   const workspace = getActiveWorkspace()
   const content = state.composer.trim()
+  const composerImages = state.composerImages
 
   if (
-    !content ||
+    (!content && composerImages.length === 0) ||
     !activeChat ||
     workspace.path === DEFAULT_WORKSPACE_PATH ||
     isChatRunning(activeChat.id) ||
@@ -1657,10 +1777,21 @@ const sendMessage = async (): Promise<void> => {
     return
   }
 
+  const imageNames = composerImages.map((image) => image.name)
+  const attachmentSummary = imageNames.length > 0 ? `Attached images: ${imageNames.join(', ')}` : ''
+  const prompt = content || 'Please analyze the attached image(s).'
+  const userContent = [content, attachmentSummary].filter(Boolean).join('\n\n')
+  const images: PromptImageAttachment[] = composerImages.map((image) => ({
+    type: 'image',
+    mimeType: image.mimeType,
+    data: image.data,
+    name: image.name
+  }))
+
   const userMessage: Message = {
     id: createId(),
     role: 'user',
-    content,
+    content: userContent,
     createdAt: now()
   }
 
@@ -1682,13 +1813,17 @@ const sendMessage = async (): Promise<void> => {
         if (chat.id !== activeChat.id) return chat
         return {
           ...chat,
-          title: chat.messages.length <= 1 ? getChatTitleFromInput(content) : chat.title,
+          title:
+            chat.messages.length <= 1
+              ? getChatTitleFromInput(content || imageNames[0] || 'New chat')
+              : chat.title,
           messages: [...chat.messages, userMessage, assistantMessage],
           updatedAt: userMessage.createdAt
         }
       })
     ),
     composer: '',
+    composerImages: [],
     chatRunStateByChatId: {
       ...current.chatRunStateByChatId,
       [activeChat.id]: {
@@ -1699,11 +1834,13 @@ const sendMessage = async (): Promise<void> => {
       }
     }
   }))
+  revokeComposerImagePreviews(composerImages)
 
   const result = await window.api.sendChatMessage({
     chatId: activeChat.id,
     cwd: workspace.path,
-    prompt: content,
+    prompt,
+    images,
     modelId: state.selectedModelId,
     thinkingLevel: state.selectedThinkingLevel
   })
@@ -2140,7 +2277,9 @@ const renderReviewDiff = (reviewFile: ReviewFile): TemplateResult => {
       ${rows.map((row) => {
         if (row.kind === 'ellipsis') {
           return html`
-            <div class="border-y border-[#333333] bg-[#292929] px-4 py-1.5 text-center text-[11px] text-[#858585]">
+            <div
+              class="border-y border-[#333333] bg-[#292929] px-4 py-1.5 text-center text-[11px] text-[#858585]"
+            >
               ${row.text}
             </div>
           `
@@ -2166,11 +2305,9 @@ const renderReviewDiff = (reviewFile: ReviewFile): TemplateResult => {
             <div class="select-none px-3 py-1 text-right font-mono text-[#666666]">
               ${formatReviewLineNumber(row.rightLineNumber)}
             </div>
-            <pre class="m-0 overflow-x-auto px-3 py-1 font-mono text-[#e6e6e6]">${row.kind === 'add'
-              ? '+'
-              : row.kind === 'remove'
-                ? '-'
-                : ' '}${row.text}</pre>
+            <pre class="m-0 overflow-x-auto px-3 py-1 font-mono text-[#e6e6e6]">
+${row.kind === 'add' ? '+' : row.kind === 'remove' ? '-' : ' '}${row.text}</pre
+            >
           </div>
         `
       })}
@@ -2219,26 +2356,34 @@ const renderReviewSidebar = (activeWorkspace: Workspace): TemplateResult => {
       <div class="min-h-0 flex-1 overflow-y-auto px-3 py-3">
         ${!hasWorkspace
           ? html`
-              <div class="rounded-2xl border border-dashed border-[#404040] px-4 py-5 text-sm text-[#9a9a9a]">
+              <div
+                class="rounded-2xl border border-dashed border-[#404040] px-4 py-5 text-sm text-[#9a9a9a]"
+              >
                 Open a git workspace to review changes inside the app.
               </div>
             `
           : state.reviewError
             ? html`
-                <div class="rounded-2xl border border-[#553636] bg-[#321f1f] px-4 py-5 text-sm text-[#f2b8b5]">
+                <div
+                  class="rounded-2xl border border-[#553636] bg-[#321f1f] px-4 py-5 text-sm text-[#f2b8b5]"
+                >
                   ${state.reviewError}
                 </div>
               `
             : state.reviewLoading && !hasFiles
               ? html`
-                  <div class="flex items-center gap-3 rounded-2xl border border-[#3b3b3b] px-4 py-5 text-sm text-[#9a9a9a]">
+                  <div
+                    class="flex items-center gap-3 rounded-2xl border border-[#3b3b3b] px-4 py-5 text-sm text-[#9a9a9a]"
+                  >
                     ${icon(LoaderCircle, 'sm', 'animate-spin')}
                     <span>Loading workspace diff…</span>
                   </div>
                 `
               : !hasFiles
                 ? html`
-                    <div class="rounded-2xl border border-dashed border-[#404040] px-4 py-5 text-sm text-[#9a9a9a]">
+                    <div
+                      class="rounded-2xl border border-dashed border-[#404040] px-4 py-5 text-sm text-[#9a9a9a]"
+                    >
                       No uncommitted file changes in this workspace.
                     </div>
                   `
@@ -2261,7 +2406,9 @@ const renderReviewSidebar = (activeWorkspace: Workspace): TemplateResult => {
                                   <div class="truncate text-[13px] font-semibold text-[#f5f5f5]">
                                     ${reviewFile.path}
                                   </div>
-                                  <div class="flex shrink-0 items-center gap-2 text-[11px] text-[#9a9a9a]">
+                                  <div
+                                    class="flex shrink-0 items-center gap-2 text-[11px] text-[#9a9a9a]"
+                                  >
                                     <span class="text-[#73d07f]">+${reviewFile.added}</span>
                                     <span class="text-[#ef8e8e]">-${reviewFile.removed}</span>
                                   </div>
@@ -2433,7 +2580,7 @@ const renderOnboarding = (): TemplateResult => {
       <div class="flex flex-col items-center gap-4">
         <button
           type="button"
-          class="inline-flex items-center gap-3 rounded-full border border-[#4b5563] bg-[#3a3a3a] px-6 py-4 text-[16px] font-medium text-[#f5f5f5] transition-colors hover:bg-[#434343] disabled:cursor-not-allowed disabled:opacity-60"
+          class="inline-flex cursor-pointer items-center gap-3 rounded-full border border-[#4b5563] bg-[#3a3a3a] px-6 py-4 text-[16px] font-medium text-[#f5f5f5] transition-colors hover:bg-[#434343] disabled:cursor-not-allowed disabled:opacity-60"
           ?disabled=${state.authBusy}
           @click=${() => void loginCodex()}
         >
@@ -2525,13 +2672,13 @@ const renderTerminalDock = (): TemplateResult => {
               (terminal) => {
                 const isActive = terminal.id === activeTerminalId
                 return html`
-                <div
-                  class=${[
-                    'h-full w-full overflow-hidden px-[10px] pb-[10px] pt-[8px]',
-                    isActive && state.terminalDockOpen ? 'block' : 'hidden'
-                  ].join(' ')}
-                  ${ref((element?: Element | null) => {
-                    if (element instanceof HTMLDivElement) {
+                  <div
+                    class=${[
+                      'h-full w-full overflow-hidden px-[10px] pb-[10px] pt-[8px]',
+                      isActive && state.terminalDockOpen ? 'block' : 'hidden'
+                    ].join(' ')}
+                    ${ref((element?: Element | null) => {
+                      if (element instanceof HTMLDivElement) {
                         ensureTerminalInstance(terminal.id, element)
                       }
                     })}
@@ -2639,6 +2786,54 @@ export const App = (): TemplateResult => {
                 >
                   ${activeQuestionPrompt ? renderInlineQuestionPrompt(activeQuestionPrompt) : ''}
 
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    class="hidden"
+                    ${ref((element?: Element | null) => {
+                      composerFileInput = element instanceof HTMLInputElement ? element : null
+                    })}
+                    @change=${(event: Event) => {
+                      const target = event.target as HTMLInputElement
+                      void handleComposerImageFiles(target.files)
+                      target.value = ''
+                    }}
+                  />
+
+                  ${
+                    state.composerImages.length > 0
+                      ? html`<div class="mb-2 flex flex-wrap gap-2">
+                          ${repeat(
+                            state.composerImages,
+                            (image) => image.id,
+                            (image) => html`
+                              <div
+                                class="flex h-14 items-center gap-2 rounded-lg border border-[#555] bg-[#343434] px-2"
+                              >
+                                <img
+                                  src=${image.previewUrl}
+                                  alt=${image.name}
+                                  class="h-10 w-10 rounded-md object-cover"
+                                />
+                                <span class="max-w-[180px] truncate text-xs text-[#d7d7d7]"
+                                  >${image.name}</span
+                                >
+                                <button
+                                  type="button"
+                                  class="rounded p-1 text-[#a7a7a7] hover:bg-[#3f3f3f] hover:text-white"
+                                  aria-label="Remove image"
+                                  @click=${() => removeComposerImage(image.id)}
+                                >
+                                  ${icon(X, 'sm')}
+                                </button>
+                              </div>
+                            `
+                          )}
+                        </div>`
+                      : ''
+                  }
+
                   <textarea
                     class="min-h-[56px] max-h-[168px] w-full resize-none overflow-y-hidden bg-transparent pb-1 text-base font-medium leading-6 text-[#f5f5f5] outline-none placeholder:text-[#a3a3a3] disabled:cursor-not-allowed disabled:opacity-70"
                     style="scrollbar-gutter: stable;"
@@ -2656,6 +2851,17 @@ export const App = (): TemplateResult => {
 
                   <div class="mt-1.5 flex items-center justify-between gap-3 pt-1.5">
                     <div class="flex min-w-0 flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        class="flex h-9 w-9 items-center justify-center rounded-lg text-[#d4d4d4] transition-all hover:bg-[#434343] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label="Attach images"
+                        title="Attach images"
+                        ?disabled=${!activeChat || isSending}
+                        @click=${openComposerImagePicker}
+                      >
+                        ${icon(ImagePlus, 'sm')}
+                      </button>
+
                       ${Select({
                         className: 'model-select-btn',
                         variant: 'ghost',
@@ -2699,7 +2905,11 @@ export const App = (): TemplateResult => {
                           ? 'Assistant responding. This becomes a stop control.'
                           : 'Send message'
                       }
-                      ?disabled=${(!state.composer.trim() || !activeChat) && !isSending}
+                      ?disabled=${
+                        (!(state.composer.trim() || state.composerImages.length > 0) ||
+                          !activeChat) &&
+                        !isSending
+                      }
                       @click=${() => void sendMessage()}
                     >
                     ${
@@ -2753,7 +2963,6 @@ export const App = (): TemplateResult => {
                 title: 'Settings',
                 description: 'Manage your account session.'
               })}
-
               ${DialogFooter({
                 children: html`
                   <div class="mt-5 flex justify-end gap-2">
@@ -2822,5 +3031,8 @@ export const App = (): TemplateResult => {
 
 window.addEventListener('keydown', onGlobalKeyDown)
 window.addEventListener('resize', scheduleTerminalFit)
+window.addEventListener('beforeunload', () => {
+  revokeComposerImagePreviews(state.composerImages)
+})
 void syncTerminalSessions()
 void syncAuthState()
